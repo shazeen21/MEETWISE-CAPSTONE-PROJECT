@@ -1,0 +1,72 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+  :root {
+    --scrollbar-thumb: #334155;
+    --scrollbar-track: #0f172a;
+  }
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--scrollbar-track);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+    border-radius: 3px;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-slate-900 border border-slate-800 rounded-xl;
+  }
+  .btn-primary {
+    @apply bg-brand-600 hover:bg-brand-500 text-white font-semibold px-4 py-2 rounded-lg transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-secondary {
+    @apply bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium px-4 py-2 rounded-lg transition-colors duration-150;
+  }
+  .btn-ghost {
+    @apply hover:bg-slate-800 text-slate-400 hover:text-slate-200 px-3 py-2 rounded-lg transition-colors duration-150;
+  }
+  .badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold;
+  }
+  .badge-blue {
+    @apply badge bg-blue-900/40 text-blue-300 ring-1 ring-blue-700/50;
+  }
+  .badge-green {
+    @apply badge bg-emerald-900/40 text-emerald-300 ring-1 ring-emerald-700/50;
+  }
+  .badge-yellow {
+    @apply badge bg-amber-900/40 text-amber-300 ring-1 ring-amber-700/50;
+  }
+  .badge-red {
+    @apply badge bg-red-900/40 text-red-300 ring-1 ring-red-700/50;
+  }
+  .badge-purple {
+    @apply badge bg-purple-900/40 text-purple-300 ring-1 ring-purple-700/50;
+  }
+  .badge-slate {
+    @apply badge bg-slate-800 text-slate-400 ring-1 ring-slate-700;
+  }
+  .input {
+    @apply bg-slate-800 border border-slate-700 text-slate-100 rounded-lg px-3 py-2 w-full focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent placeholder-slate-500 text-sm;
+  }
+  .label {
+    @apply text-sm font-medium text-slate-300 mb-1 block;
+  }
+  .section-title {
+    @apply text-lg font-semibold text-slate-100;
+  }
+  .muted {
+    @apply text-slate-400 text-sm;
+  }
+}

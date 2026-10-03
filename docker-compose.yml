@@ -1,0 +1,46 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: meetwise-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: meetwise_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d meetwise_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: meetwise-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://postgres:postgrespassword@postgres:5432/meetwise_db
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - HF_TOKEN=${HF_TOKEN}
+      - WHISPER_MODEL=base
+      - WHISPER_DEVICE=cpu
+      - WHISPER_COMPUTE_TYPE=int8
+      - BGE_MODEL=BAAI/bge-small-en-v1.5
+      - CHROMA_PERSIST_DIR=/app/data/chromadb
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+
+volumes:
+  postgres_data:
+
