@@ -76,3 +76,34 @@ def test_chroma_service_and_rag(tmp_path):
     assert rag_output.sources[0].speaker == "SPEAKER_00"
     assert rag_output.sources[0].start_time == 130.0
 
+
+
+def _rag_with_chunks(chunks, answer_text):
+    chroma = MagicMock()
+    chroma.query_similar.return_value = chunks
+    rag = RAGPipeline(bge_service=MagicMock(), chroma_service=chroma, gemini_api_key="k")
+    model = MagicMock()
+    model.generate_content.return_value = MagicMock(text=answer_text)
+    rag._gemini_client = model
+    return rag, model
+
+
+def _chunk(n, similarity):
+    return {
+        "chunk_id": f"c{n}", "text": f"[00:0{n}] SPEAKER_00: passage {n}", "similarity": similarity,
+        "metadata": {"meeting_id": "m1", "meeting_title": "Sync", "speakers": "SPEAKER_00", "start_time": n, "end_time": n + 1},
+    }
+
+
+def test_rag_does_not_call_llm_when_nothing_is_relevant():
+    rag, model = _rag_with_chunks([_chunk(1, 0.40), _chunk(2, 0.30)], "made-up answer")
+    out = rag.query("What is the capital of France?")
+    assert out.answer.startswith("Based on the available meeting records")
+    assert out.sources == []
+    model.generate_content.assert_not_called()
+
+
+def test_rag_returns_only_cited_sources():
+    rag, _ = _rag_with_chunks([_chunk(1, 0.70), _chunk(2, 0.66), _chunk(3, 0.20)], "SPEAKER_00 said it [2].")
+    out = rag.query("What was said?")
+    assert [s.start_time for s in out.sources] == [2.0]

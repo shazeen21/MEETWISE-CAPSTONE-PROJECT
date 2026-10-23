@@ -14,6 +14,7 @@ Orchestrates the 10-phase enterprise processing pipeline:
 """
 
 import os
+import json
 import uuid
 import logging
 from pathlib import Path
@@ -38,6 +39,34 @@ from .reports.pdf_generator import MOMPDFGenerator
 from .notifications.dispatcher import NotificationDispatcher
 
 logger = logging.getLogger(__name__)
+
+# Ordered stage labels reported to the UI while a meeting is processing.
+PIPELINE_STAGES = [
+    "Audio Cleaning & Noise Reduction",
+    "Speech-to-Text (WhisperX)",
+    "Speaker Diarization",
+    "Transcript & Speaker Alignment",
+    "Speaker Identification",
+    "Meeting Intelligence (MOM, Action Items, Topics, Emotions)",
+    "Saving Meeting Records",
+    "ChromaDB Indexing",
+    "MOM PDF Generation",
+    "Participant Notifications",
+]
+
+# meeting_id -> {"stage": int, "total": int, "label": str, "state": "running"|"completed"|"failed", "error": str|None}
+# In-memory only: progress is lost on restart, which is fine for a live UI indicator.
+PIPELINE_PROGRESS: Dict[str, Dict[str, Any]] = {}
+
+
+def _report_stage(meeting_id: str, stage: int) -> None:
+    PIPELINE_PROGRESS[meeting_id] = {
+        "stage": stage,
+        "total": len(PIPELINE_STAGES),
+        "label": PIPELINE_STAGES[stage],
+        "state": "running",
+        "error": None,
+    }
 
 
 class PipelineExecutionError(Exception):
@@ -98,7 +127,7 @@ class MeetWisePipeline:
         self.chroma = chroma_service or ChromaService(persist_dir=settings.CHROMA_PERSIST_DIR)
 
         # 8. Document Generation
-        self.pdf_generator = pdf_generator or MOMPDFGenerator()
+        self.pdf_generator = pdf_generator or MOMPDFGenerator(output_dir=str(Path(settings.DATA_DIR) / "reports"))
 
     def _extract_speaker_audio_slices(
         self,
@@ -137,7 +166,19 @@ class MeetWisePipeline:
             logger.warning(f"Failed to slice speaker audio for biometrics: {e}")
             return {}
 
-    def process_meeting(
+    def process_meeting(self, audio_path: str, db: Session, meeting_id: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+        """Run the pipeline while recording stage progress in PIPELINE_PROGRESS for the UI."""
+        meeting_id = meeting_id or str(uuid.uuid4())
+        _report_stage(meeting_id, 0)
+        try:
+            result = self._run_pipeline(audio_path, db, meeting_id=meeting_id, **kwargs)
+        except Exception as e:
+            PIPELINE_PROGRESS[meeting_id].update(state="failed", error=str(e))
+            raise
+        PIPELINE_PROGRESS[meeting_id].update(stage=len(PIPELINE_STAGES), state="completed")
+        return result
+
+    def _run_pipeline(
         self,
         audio_path: str,
         db: Session,
@@ -155,9 +196,17 @@ class MeetWisePipeline:
         logger.info(f"=== Starting MeetWise Enterprise Pipeline for Meeting {meeting_id} ({media_file_name}) ===")
         repo = MeetingRepository(db)
 
+        # Load the gated diarization model before the slow ASR work, so a missing or
+        # unauthorized HF_TOKEN fails in seconds instead of after transcription.
+        try:
+            self.pyannote.preload()
+        except Exception as e:
+            raise PipelineExecutionError(f"Speaker Diarization failed: {e}. Please ensure your HF_TOKEN is valid and you have accepted the model terms on Hugging Face.")
+
         # ----------------------------------------------------
         # Phase 1: Ingestion, Demuxing (Video/Audio) & Denoising
         # ----------------------------------------------------
+        _report_stage(meeting_id, 0)
         logger.info("[1/10] Ingesting media, demuxing streams, and cleaning audio...")
         try:
             preprocess_res = self.preprocessor.process(
@@ -174,6 +223,7 @@ class MeetWisePipeline:
         # ----------------------------------------------------
         # Phase 2: WhisperX Speech Recognition
         # ----------------------------------------------------
+        _report_stage(meeting_id, 1)
         logger.info("[2/10] Transcribing speech with WhisperX / faster-whisper...")
         try:
             asr_result = self.whisperx.transcribe(clean_audio)
@@ -185,6 +235,7 @@ class MeetWisePipeline:
         # ----------------------------------------------------
         # Phase 3: pyannote.audio Multi-Speaker Diarization
         # ----------------------------------------------------
+        _report_stage(meeting_id, 2)
         logger.info("[3/10] Running neural speaker diarization...")
         try:
             speaker_turns = self.pyannote.diarize(
@@ -201,6 +252,7 @@ class MeetWisePipeline:
         # ----------------------------------------------------
         # Phase 4: Temporal Intersection Alignment
         # ----------------------------------------------------
+        _report_stage(meeting_id, 3)
         logger.info("[4/10] Aligning word timestamps and speaker turns...")
         try:
             aligned_segments = self.aligner.align(raw_segments, speaker_turns)
@@ -215,6 +267,7 @@ class MeetWisePipeline:
         # ----------------------------------------------------
         # Phase 5: Voice Biometrics & Speaker Recognition
         # ----------------------------------------------------
+        _report_stage(meeting_id, 4)
         logger.info("[5/10] Identifying speakers against enrolled employee voiceprints...")
         speaker_identifications: Dict[str, Dict[str, Any]] = {}
         try:
@@ -229,6 +282,16 @@ class MeetWisePipeline:
                 }
                 for emp in enrolled_emps
             ]
+            # The accent an employee declared at registration is the only real accent
+            # source; nothing in the pipeline detects accents from audio.
+            accent_by_id: Dict[str, str] = {}
+            for emp in enrolled_emps:
+                try:
+                    hint = json.loads(emp.accent_metadata or "{}").get("primary_accent")
+                except (ValueError, AttributeError):
+                    hint = None
+                if hint:
+                    accent_by_id[emp.id] = hint
 
             speaker_audio_slices = self._extract_speaker_audio_slices(clean_audio, aligned_segments)
             unique_spks = sorted(list(set(s.get("speaker") for s in aligned_segments if "speaker" in s)))
@@ -255,6 +318,8 @@ class MeetWisePipeline:
                 id_res = self.speaker_recognition.decide(scored[spk_label], excluded_ids=assigned_ids)
                 if not id_res["is_unknown"]:
                     assigned_ids.add(id_res["employee_id"])
+                    if id_res["employee_id"] in accent_by_id:
+                        id_res["accent"] = accent_by_id[id_res["employee_id"]]
                 speaker_identifications[spk_label] = id_res
 
             for spk_label, id_res in speaker_identifications.items():
@@ -291,6 +356,7 @@ class MeetWisePipeline:
         # ----------------------------------------------------
         # Phase 6: Gemini Enterprise Meeting Intelligence
         # ----------------------------------------------------
+        _report_stage(meeting_id, 5)
         logger.info("[6/10] Extracting enterprise intelligence with Gemini...")
         # Only names that were verified by voice. Passing the whole roster invites the
         # LLM to attribute "Unknown Speaker"/SPEAKER_xx turns to people who never spoke.
@@ -306,11 +372,12 @@ class MeetWisePipeline:
         except Exception as e:
             logger.warning(f"Gemini intelligence extraction error: {e}. Building fallback intelligence.")
             inferred_title = title or f"Meeting on {media_file_name}"
+            # Say plainly that no AI analysis happened; never present placeholder text as a summary.
             intelligence = MeetingIntelligence(
                 title=inferred_title,
-                summary="Meeting recording processed. Automatic LLM summarization generated a fallback brief.",
-                agenda=["General Discussion"],
-                discussion_points=["Reviewed meeting recording items."],
+                summary=f"AI summary unavailable: meeting intelligence extraction failed ({e}). The transcript below is complete; reprocess the meeting to generate the summary, decisions and action items.",
+                agenda=[],
+                discussion_points=[],
                 topics=[],
                 decisions=[],
                 action_items=[],
@@ -345,6 +412,7 @@ class MeetWisePipeline:
         # ----------------------------------------------------
         # Phase 7: PostgreSQL / SQLite Relational Persistence
         # ----------------------------------------------------
+        _report_stage(meeting_id, 6)
         logger.info("[7/10] Persisting enterprise meeting records to database...")
         try:
             meeting_record = repo.save_meeting_pipeline_results(
@@ -365,6 +433,7 @@ class MeetWisePipeline:
         # ----------------------------------------------------
         # Phase 8: Semantic Chunking & ChromaDB Vector Indexing
         # ----------------------------------------------------
+        _report_stage(meeting_id, 7)
         logger.info("[8/10] Indexing transcripts and meeting intelligence into ChromaDB RAG...")
         try:
             chunks = self.chunker.chunk_transcript(
@@ -372,6 +441,9 @@ class MeetWisePipeline:
                 meeting_title=meeting_title,
                 aligned_segments=aligned_segments,
             )
+            # Reprocessing can yield fewer chunks; leftover ones would let search quote
+            # transcript text that no longer exists.
+            self.chroma.delete_meeting_chunks(meeting_id)
             if chunks:
                 chunk_texts = [c.text for c in chunks]
                 embeddings = self.bge.embed_documents(chunk_texts)
@@ -383,6 +455,7 @@ class MeetWisePipeline:
         # ----------------------------------------------------
         # Phase 9: Minutes of Meeting (MOM) PDF Generation
         # ----------------------------------------------------
+        _report_stage(meeting_id, 8)
         logger.info("[9/10] Generating downloadable Minutes of Meeting (MOM) PDF...")
         pdf_path = None
         try:
@@ -400,7 +473,7 @@ class MeetWisePipeline:
                         "speaker_name": s.speaker_name,
                         "confidence_score": s.confidence_score,
                         "total_speaking_time": s.total_speaking_time,
-                        "detected_accent": s.detected_accent or "International English",
+                        "detected_accent": s.detected_accent or "Not detected",
                     }
                     for s in meeting_record.speakers
                 ],
@@ -416,6 +489,7 @@ class MeetWisePipeline:
         # ----------------------------------------------------
         # Phase 10: Multi-Channel Notification Fan-Out
         # ----------------------------------------------------
+        _report_stage(meeting_id, 9)
         logger.info("[10/10] Dispatching participant summaries and manager alerts...")
         try:
             dispatcher = NotificationDispatcher(repository=repo)
@@ -424,7 +498,7 @@ class MeetWisePipeline:
                 meeting_id=meeting_id,
                 meeting_title=meeting_title,
                 intelligence_data=intelligence.model_dump(),
-                participant_names=participants or ["Organizer"],
+                participant_names=participants,
             )
         except Exception as notif_err:
             logger.warning(f"Notification dispatch warning: {notif_err}")

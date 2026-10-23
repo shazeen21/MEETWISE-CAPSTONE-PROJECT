@@ -70,15 +70,20 @@ class NotificationDispatcher:
             )
             dispatched_logs.append({"recipient": person, "channel": "internal", "id": notif.id})
 
-            # Also create an email dispatch record
-            email_notif = self.repo.create_notification(
-                meeting_id=meeting_id,
-                recipient=f"{person.lower().replace(' ', '.')}@company.internal",
-                channel="email",
-                subject=subject,
-                payload=payload,
-            )
-            dispatched_logs.append({"recipient": person, "channel": "email", "id": email_notif.id})
+            # Queue an email record only for a registered address. No SMTP sender exists,
+            # so it is stored as "queued" rather than claiming it was sent, and invented
+            # addresses are never generated.
+            emp = self.repo.get_employee_by_name(person)
+            if emp and emp.email:
+                email_notif = self.repo.create_notification(
+                    meeting_id=meeting_id,
+                    recipient=emp.email,
+                    channel="email",
+                    subject=subject,
+                    payload=payload,
+                    status="queued",
+                )
+                dispatched_logs.append({"recipient": person, "channel": "email", "id": email_notif.id})
 
         # 2. Slack Webhook notification (if configured)
         if self.slack_webhook_url:

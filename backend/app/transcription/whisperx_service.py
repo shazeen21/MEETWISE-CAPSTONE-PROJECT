@@ -5,6 +5,7 @@ Transcribes audio into timestamped segments and runs phoneme alignment.
 Includes native SoundFile audio loading (zero FFmpeg dependency) and faster-whisper fallback.
 """
 
+import os
 import logging
 from typing import Dict, Any, List, Optional
 import numpy as np
@@ -58,6 +59,7 @@ class WhisperXService:
         self._model = None
         self._align_model = None
         self._align_metadata = None
+        self._align_language: Optional[str] = None
 
     def _get_model(self):
         """Lazy load the WhisperX model."""
@@ -69,10 +71,12 @@ class WhisperXService:
                     f"Loading WhisperX model '{self.model_name}' on device '{self.device}' "
                     f"with compute_type '{self.compute_type}'..."
                 )
+                # faster-whisper defaults to 4 CPU threads; use the whole machine.
                 self._model = whisperx.load_model(
                     self.model_name,
                     device=self.device,
                     compute_type=self.compute_type,
+                    threads=os.cpu_count() or 4,
                 )
                 logger.info("WhisperX model loaded successfully.")
             except ImportError:
@@ -98,7 +102,15 @@ class WhisperXService:
                 device=self.device,
                 compute_type=self.compute_type,
             )
-            segments_gen, info = fw_model.transcribe(audio, language=language)
+            # VAD skips silence and noise, where Whisper otherwise invents text
+            # ("Thank you for watching"); not conditioning on previous text stops a
+            # bad guess from repeating through the rest of the meeting.
+            segments_gen, info = fw_model.transcribe(
+                audio,
+                language=language,
+                vad_filter=True,
+                condition_on_previous_text=False,
+            )
             cleaned_segments: List[Dict[str, Any]] = []
 
             for seg in segments_gen:
@@ -160,10 +172,14 @@ class WhisperXService:
             if align and raw_segments:
                 try:
                     logger.info(f"Aligning transcript segments for language '{detected_lang}'...")
-                    align_model, metadata = whisperx.load_align_model(
-                        language_code=detected_lang,
-                        device=self.device,
-                    )
+                    # Reuse the wav2vec2 alignment model across meetings of the same language.
+                    if self._align_model is None or self._align_language != detected_lang:
+                        self._align_model, self._align_metadata = whisperx.load_align_model(
+                            language_code=detected_lang,
+                            device=self.device,
+                        )
+                        self._align_language = detected_lang
+                    align_model, metadata = self._align_model, self._align_metadata
                     alignment_res = whisperx.align(
                         raw_segments,
                         align_model,

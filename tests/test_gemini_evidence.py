@@ -152,3 +152,66 @@ def test_sentiment_is_derived_from_segment_emotions(gemini_service):
     assert sa.overall_sentiment == "negative"
     dominant = {e.speaker: e.dominant_emotion for e in result.emotions}
     assert dominant == {"Alice": "frustration", "Bob": "joy"}
+
+
+def test_short_or_partial_word_quotes_are_not_evidence(gemini_service):
+    segments = [{"speaker": "Alice", "start": 0.0, "end": 9.0, "text": "Okay so I think we should restart the deployment later today."}]
+    intelligence = MeetingIntelligence(
+        title="t", summary="s",
+        decisions=[
+            {"decision": "Generic", "evidence": "okay so"},          # too short to prove anything
+            {"decision": "Partial word", "evidence": "start the deployment later"},  # only inside "restart"
+        ],
+    )
+    verified = gemini_service._verify_evidence(intelligence, segments)
+    assert verified.decisions == []
+
+
+def test_decision_timestamp_comes_from_matched_segment(gemini_service):
+    segments = [
+        {"speaker": "Alice", "start": 0.0, "end": 5.0, "text": "Let's review the numbers."},
+        {"speaker": "Bob", "start": 125.0, "end": 130.0, "text": "We agreed to move the launch to March."},
+    ]
+    intelligence = MeetingIntelligence(
+        title="t", summary="s",
+        decisions=[{"decision": "Launch moved", "timestamp": "00:00", "evidence": "agreed to move the launch"}],
+    )
+    verified = gemini_service._verify_evidence(intelligence, segments)
+    assert verified.decisions[0].timestamp == "02:05"
+
+
+def test_ground_details_removes_unsupported_details(gemini_service):
+    segments = [
+        {"speaker": "Alice", "start": 0.0, "end": 5.0, "text": "Bob, please update the pricing page by Friday."},
+        {"speaker": "Bob", "start": 5.0, "end": 9.0, "text": "Sure, and I will email the vendor too."},
+    ]
+    intelligence = MeetingIntelligence(
+        title="t", summary="s",
+        decisions=[{"decision": "Pricing page update", "evidence": "please update the pricing page"}],
+        action_items=[
+            {"task": "Update pricing page", "owner": "Bob", "deadline": "Friday", "evidence": "please update the pricing page"},
+            {"task": "Email vendor", "owner": "Charlie", "deadline": "Monday", "evidence": "I will email the vendor"},
+        ],
+        keywords=[{"keyword": "pricing page"}, {"keyword": "Kubernetes"}],
+        topics=[{"topic": "Pricing", "start_time": -3.0, "end_time": 500.0, "participants": ["Alice", "Zed"]}],
+        accents=[{"speaker": "Alice", "detected_accent": "British"}],
+        employee_reports=[
+            {"employee_name": "Bob", "assigned_tasks": ["Invented task"]},
+            {"employee_name": "Charlie", "assigned_tasks": ["Email vendor"]},
+        ],
+        manager_summary={"executive_summary": "x", "key_decisions": ["Invented decision"], "assigned_tasks": ["Invented"]},
+        sentiment_analysis={"key_emotional_moments": ["[#1] Bob agrees", "[#99] nonexistent", "no reference"]},
+    )
+    result = gemini_service._ground_details(gemini_service._verify_evidence(intelligence, segments), segments)
+
+    owners = {a.task: (a.owner, a.deadline) for a in result.action_items}
+    assert owners["Update pricing page"] == ("Bob", "Friday")
+    assert owners["Email vendor"] == ("Unassigned", "Not specified")  # Charlie never spoke or was named; Monday never said
+    assert [k.keyword for k in result.keywords] == ["pricing page"]
+    topic = result.topics[0]
+    assert (topic.start_time, topic.end_time, topic.participants) == (0.0, 9.0, ["Alice"])
+    assert result.accents == []
+    assert [r.employee_name for r in result.employee_reports] == ["Bob"]
+    assert result.employee_reports[0].assigned_tasks == ["Update pricing page"]
+    assert result.manager_summary.key_decisions == ["Pricing page update"]
+    assert result.sentiment_analysis.key_emotional_moments == ["[#1] Bob agrees"]

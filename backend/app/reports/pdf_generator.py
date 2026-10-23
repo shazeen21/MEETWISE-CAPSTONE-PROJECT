@@ -193,7 +193,7 @@ class MOMPDFGenerator:
                         Paragraph(str(spk.get("speaker_name", spk.get("name", "Unknown"))), table_cell_bold),
                         Paragraph(conf_pct, table_cell),
                         Paragraph(f"{round(float(spk.get('total_speaking_time', 0.0)), 1)}s", table_cell),
-                        Paragraph(str(spk.get("detected_accent", "International English")), table_cell),
+                        Paragraph(str(spk.get("detected_accent") or "Not detected"), table_cell),
                     ])
             else:
                 spk_rows.append([Paragraph("No speakers identified", table_cell), Paragraph("-", table_cell), Paragraph("-", table_cell), Paragraph("-", table_cell), Paragraph("-", table_cell)])

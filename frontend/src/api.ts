@@ -189,8 +189,15 @@ export const meetingsApi = {
       headers: { 'Content-Type': 'multipart/form-data' },
     }).then(r => r.data),
 
-  process: (id: string) =>
-    api.post(`/meetings/${id}/process`).then(r => r.data),
+  process: (id: string, numSpeakers?: number) =>
+    api.post(`/meetings/${id}/process`, null, {
+      params: numSpeakers ? { num_speakers: numSpeakers } : undefined,
+    }).then(r => r.data),
+
+  getProgress: (id: string) =>
+    api.get<{ stage: number; total: number; stages: string[]; state: 'pending' | 'running' | 'completed' | 'failed'; label: string | null; error: string | null }>(
+      `/meetings/${id}/progress`,
+    ).then(r => r.data),
 
   delete: (id: string) =>
     api.delete(`/meetings/${id}`).then(r => r.data),

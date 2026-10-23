@@ -32,6 +32,10 @@ class PyannoteService:
         self.device = device
         self._pipeline = None
 
+    def preload(self) -> None:
+        """Load the pipeline now, raising DiarizationError if the token or model access is invalid."""
+        self._get_pipeline()
+
     def _get_pipeline(self):
         """Lazy load the pyannote pipeline."""
         if self._pipeline is None:

@@ -82,6 +82,10 @@ class MeetingRepository:
             .first()
         )
 
+    def get_employee_by_name(self, name: str) -> Optional[Employee]:
+        """Fetch employee by exact display name."""
+        return self.db.query(Employee).filter(Employee.name == name).first()
+
     def get_employee_by_email(self, email: str) -> Optional[Employee]:
         """Fetch employee by email."""
         return self.db.query(Employee).filter(Employee.email == email).first()
@@ -206,7 +210,7 @@ class MeetingRepository:
             if not meeting:
                 meeting = Meeting(
                     id=meeting_id,
-                    title=intelligence.title or title,
+                    title=title or intelligence.title,
                     audio_file_name=audio_file_name,
                     duration_seconds=duration_seconds,
                     media_type=media_type,
@@ -218,7 +222,8 @@ class MeetingRepository:
                 )
                 self.db.add(meeting)
             else:
-                meeting.title = intelligence.title or title
+                # The caller's title (user-supplied, else the LLM's) wins over intelligence.title.
+                meeting.title = title or intelligence.title
                 meeting.summary = intelligence.summary
                 meeting.duration_seconds = duration_seconds
                 meeting.media_type = media_type
@@ -359,10 +364,12 @@ class MeetingRepository:
             # 8. Insert Personalized Employee Reports
             if hasattr(intelligence, "employee_reports") and intelligence.employee_reports:
                 for rep in intelligence.employee_reports:
-                    matched_emp = self.get_employee(rep.employee_name)
+                    # Link only voice-verified speakers; employee_name is a display name, not an ID.
+                    id_info = speaker_identifications.get(rep.employee_name, {})
+                    linked_emp_id = None if id_info.get("is_unknown", True) else id_info.get("employee_id")
                     emp_report = EmployeeReport(
                         meeting_id=meeting_id,
-                        employee_id=matched_emp.id if matched_emp else None,
+                        employee_id=linked_emp_id,
                         employee_name=rep.employee_name,
                         topics_discussed=json.dumps(rep.topics_discussed),
                         decisions_affecting=json.dumps(rep.decisions_affecting),
@@ -489,13 +496,14 @@ class MeetingRepository:
         channel: str = "internal",
         subject: Optional[str] = None,
         payload: Optional[Dict[str, Any]] = None,
+        status: str = "sent",
     ) -> Notification:
         """Record a notification sent to a participant or manager."""
         notif = Notification(
             meeting_id=meeting_id,
             recipient=recipient,
             channel=channel,
-            status="sent",
+            status=status,
             subject=subject,
             payload=json.dumps(payload) if payload else None,
         )

@@ -9,18 +9,21 @@ import { formatDuration } from '../utils'
 
 // ─── Processing Steps ─────────────────────────────────────────────────────────
 
+// Mirrors PIPELINE_STAGES in backend/app/pipeline.py; replaced by the server's list once polling starts.
 const PROCESSING_STEPS = [
   'Audio Cleaning & Noise Reduction',
-  'Voice Activity Detection',
-  'Speaker Diarization',
-  'Speaker Identification',
   'Speech-to-Text (WhisperX)',
-  'Emotion & Accent Detection',
-  'Topic & Keyword Extraction',
-  'Action Item Detection',
-  'MOM Generation',
+  'Speaker Diarization',
+  'Transcript & Speaker Alignment',
+  'Speaker Identification',
+  'Meeting Intelligence (MOM, Action Items, Topics, Emotions)',
+  'Saving Meeting Records',
   'ChromaDB Indexing',
+  'MOM PDF Generation',
+  'Participant Notifications',
 ]
+
+const PROGRESS_POLL_MS = 2000
 
 // ─── Accepted File Types ───────────────────────────────────────────────────────
 
@@ -58,8 +61,9 @@ export default function UploadMeeting() {
 
   // Upload state
   const [isUploading, setIsUploading] = useState(false)
+  // Index of the stage the backend is running; every earlier stage is done.
   const [activeStep, setActiveStep] = useState<number>(-1)
-  const [completedSteps, setCompletedSteps] = useState<number[]>([])
+  const [steps, setSteps] = useState<string[]>(PROCESSING_STEPS)
   const [result, setResult] = useState<{ id: string; title: string } | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -79,26 +83,19 @@ export default function UploadMeeting() {
     disabled: isUploading,
   })
 
-  // ─── Processing Animation ─────────────────────────────────────────────────
+  // ─── Live Progress ────────────────────────────────────────────────────────
 
-  function runProcessingAnimation(): Promise<void> {
-    return new Promise((resolve) => {
-      let step = 0
-      setActiveStep(0)
-
-      const interval = setInterval(() => {
-        setCompletedSteps(prev => [...prev, step])
-        step += 1
-
-        if (step >= PROCESSING_STEPS.length) {
-          clearInterval(interval)
-          setActiveStep(-1)
-          resolve()
-        } else {
-          setActiveStep(step)
-        }
-      }, 2500)
-    })
+  function pollProgress(meetingId: string): () => void {
+    const interval = setInterval(async () => {
+      try {
+        const p = await meetingsApi.getProgress(meetingId)
+        if (p.stages?.length) setSteps(p.stages)
+        if (p.stage >= 0) setActiveStep(p.stage)
+      } catch {
+        // Transient poll failures are harmless; the next tick retries.
+      }
+    }, PROGRESS_POLL_MS)
+    return () => clearInterval(interval)
   }
 
   // ─── Submit ────────────────────────────────────────────────────────────────
@@ -112,28 +109,38 @@ export default function UploadMeeting() {
     setIsUploading(true)
     setError(null)
     setResult(null)
-    setCompletedSteps([])
     setActiveStep(-1)
+    setSteps(PROCESSING_STEPS)
 
     const formData = new FormData()
     formData.append('file', file)
     if (title.trim()) formData.append('title', title.trim())
-    if (numSpeakers.trim()) formData.append('num_speakers', numSpeakers.trim())
     formData.append('source_type', sourceType)
-    formData.append('process_immediately', String(processImmediately))
+    // Upload first, then process separately so the page can poll the meeting's progress.
+    formData.append('process_immediately', 'false')
 
+    let stopPolling: (() => void) | null = null
     try {
-      // Start animation concurrently with the upload
-      const animationPromise = runProcessingAnimation()
+      const uploaded = await meetingsApi.upload(formData)
+      const meetingId: string = uploaded.meeting_id
 
-      const data = await meetingsApi.upload(formData)
+      if (!processImmediately) {
+        setResult({ id: meetingId, title: title || file.name })
+        toast.success('Meeting uploaded.')
+        return
+      }
 
-      // Wait for animation to finish so UX feels smooth
-      await animationPromise
+      setActiveStep(0)
+      stopPolling = pollProgress(meetingId)
+      const speakers = numSpeakers.trim() ? Number(numSpeakers) : undefined
+      const data = await meetingsApi.process(meetingId, speakers)
+      stopPolling()
+      setActiveStep(steps.length)
 
-      setResult({ id: data.id ?? data.meeting_id, title: (data.title ?? title) || file.name })
+      setResult({ id: meetingId, title: (data.meeting?.title ?? title) || file.name })
       toast.success('Meeting processed successfully!')
     } catch (err: unknown) {
+      stopPolling?.()
       const detail =
         (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
         (err instanceof Error ? err.message : 'Upload failed. Please try again.')
@@ -313,8 +320,8 @@ export default function UploadMeeting() {
               <p className="text-sm font-semibold text-slate-200">Processing your meeting…</p>
             </div>
             <ol className="space-y-2.5">
-              {PROCESSING_STEPS.map((step, idx) => {
-                const isDone = completedSteps.includes(idx)
+              {steps.map((step, idx) => {
+                const isDone = idx < activeStep
                 const isActive = activeStep === idx
 
                 return (

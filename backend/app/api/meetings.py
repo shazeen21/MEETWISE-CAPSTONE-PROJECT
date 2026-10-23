@@ -25,7 +25,7 @@ from ..config import settings
 from ..database.connection import get_db
 from ..database.repository import MeetingRepository
 from ..audio.preprocessor import SUPPORTED_EXTENSIONS
-from ..pipeline import MeetWisePipeline, PipelineExecutionError
+from ..pipeline import MeetWisePipeline, PipelineExecutionError, PIPELINE_PROGRESS, PIPELINE_STAGES
 from ..reports.pdf_generator import MOMPDFGenerator
 
 logger = logging.getLogger(__name__)
@@ -33,7 +33,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/meetings", tags=["Meetings"])
 
 _pipeline_instance = None
-pdf_gen = MOMPDFGenerator()
+REPORTS_DIR = Path(settings.DATA_DIR) / "reports"
+pdf_gen = MOMPDFGenerator(output_dir=str(REPORTS_DIR))
+
+
+def _default_title(file_name: str) -> str:
+    return f"Meeting ({file_name})"
 
 
 def get_pipeline() -> MeetWisePipeline:
@@ -43,8 +48,10 @@ def get_pipeline() -> MeetWisePipeline:
     return _pipeline_instance
 
 
+# Plain def: FastAPI runs it in a worker thread. As async def, the multi-minute
+# pipeline below blocked the event loop and froze every other request.
 @router.post("/upload", status_code=status.HTTP_201_CREATED)
-async def upload_meeting_media(
+def upload_meeting_media(
     file: UploadFile = File(..., description="Meeting audio or video recording (.wav, .mp3, .m4a, .mp4, .webm)"),
     title: Optional[str] = Form(None, description="Optional custom meeting title"),
     source_type: str = Form("uploaded", description="Audio source: 'uploaded' or 'live'"),
@@ -87,7 +94,7 @@ async def upload_meeting_media(
         repo = MeetingRepository(db)
         repo.create_meeting(
             meeting_id=meeting_id,
-            title=title or f"Meeting ({file.filename})",
+            title=title or _default_title(file.filename),
             audio_file_name=safe_filename,
             source_type=source_type,
         )
@@ -141,12 +148,17 @@ def process_existing_meeting(
     if not media_path.exists():
         raise HTTPException(status_code=404, detail=f"Media file '{meeting.audio_file_name}' not found on server.")
 
+    # A placeholder title from upload must not override the title generated from the content.
+    user_title = meeting.title
+    if user_title == _default_title(meeting.audio_file_name.split("_", 1)[-1]):
+        user_title = None
+
     try:
         result = pipeline.process_meeting(
             audio_path=str(media_path),
             db=db,
             meeting_id=meeting.id,
-            title=meeting.title,
+            title=user_title,
             source_type=meeting.source_type,
             num_speakers=num_speakers,
             min_speakers=min_speakers,
@@ -156,6 +168,45 @@ def process_existing_meeting(
     except Exception as e:
         logger.error(f"Pipeline error for meeting {meeting_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
+
+
+@router.delete("/{meeting_id}")
+def delete_meeting(meeting_id: str, db: Session = Depends(get_db), pipeline: MeetWisePipeline = Depends(get_pipeline)):
+    """Delete a meeting, its search index entries, and its stored media and reports."""
+    repo = MeetingRepository(db)
+    meeting = repo.get_meeting(meeting_id)
+    if not meeting:
+        raise HTTPException(status_code=404, detail=f"Meeting '{meeting_id}' not found.")
+
+    stem = Path(meeting.audio_file_name).stem
+    files = [
+        Path(settings.AUDIO_DIR) / meeting.audio_file_name,
+        Path(settings.PROCESSED_DIR) / f"{stem}_16k_mono.wav",
+        Path(settings.PROCESSED_DIR) / f"{stem}_clean.wav",
+        Path(settings.TRANSCRIPTS_DIR) / f"{meeting_id}.json",
+        REPORTS_DIR / f"MOM_{meeting_id}.pdf",
+    ]
+    repo.delete_meeting(meeting_id)
+    try:
+        pipeline.chroma.delete_meeting_chunks(meeting_id)
+    except Exception as e:
+        logger.warning(f"Could not remove search index entries for meeting {meeting_id}: {e}")
+    for f in files:
+        try:
+            f.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning(f"Could not delete {f}: {e}")
+    PIPELINE_PROGRESS.pop(meeting_id, None)
+    return {"status": "deleted", "meeting_id": meeting_id}
+
+
+@router.get("/{meeting_id}/progress")
+def get_processing_progress(meeting_id: str):
+    """Current pipeline stage for a meeting that is (or was recently) processing."""
+    progress = PIPELINE_PROGRESS.get(meeting_id)
+    if progress is None:
+        return {"stage": -1, "total": len(PIPELINE_STAGES), "stages": PIPELINE_STAGES, "state": "pending", "label": None, "error": None}
+    return {**progress, "stages": PIPELINE_STAGES}
 
 
 @router.get("")
@@ -325,7 +376,7 @@ def download_mom_pdf(meeting_id: str, db: Session = Depends(get_db)):
     if not meeting:
         raise HTTPException(status_code=404, detail=f"Meeting '{meeting_id}' not found.")
 
-    pdf_file = Path(f"data/reports/MOM_{meeting_id}.pdf")
+    pdf_file = REPORTS_DIR / f"MOM_{meeting_id}.pdf"
     if not pdf_file.exists():
         # Generate on the fly
         mom_payload = {
@@ -342,7 +393,7 @@ def download_mom_pdf(meeting_id: str, db: Session = Depends(get_db)):
                     "speaker_name": s.speaker_name,
                     "confidence_score": s.confidence_score,
                     "total_speaking_time": s.total_speaking_time,
-                    "detected_accent": s.detected_accent or "International English",
+                    "detected_accent": s.detected_accent or "Not detected",
                 }
                 for s in meeting.speakers
             ],
@@ -443,7 +494,7 @@ def get_meeting_analytics(meeting_id: str, db: Session = Depends(get_db)):
             "name": s.speaker_name or s.speaker_label,
             "speaking_time": s.total_speaking_time,
             "confidence": s.confidence_score,
-            "accent": s.detected_accent or "International English",
+            "accent": s.detected_accent,
             "dominant_emotion": s.dominant_emotion or "neutral",
         }
         for s in meeting.speakers

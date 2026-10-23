@@ -26,7 +26,8 @@ def test_meeting_pipeline_persistence(db_session, sample_intelligence):
 
     # 1. Verify meeting fields
     assert meeting.id == meeting_id
-    assert meeting.title == sample_intelligence.title
+    # The caller's title (the pipeline passes the user's title, else the LLM's) is kept.
+    assert meeting.title == "Architecture Sync"
     assert meeting.duration_seconds == 8.2
     assert meeting.source_type == "uploaded"
 

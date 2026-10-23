@@ -143,6 +143,9 @@ class ChromaService:
                         "text": doc,
                         "metadata": meta,
                         "distance": dist,
+                        # The collection uses squared L2 over L2-normalized BGE vectors,
+                        # for which cosine similarity = 1 - d / 2.
+                        "similarity": 1.0 - float(dist) / 2.0,
                     })
 
             logger.info(f"Retrieved {len(retrieved)} relevant chunks from ChromaDB.")
