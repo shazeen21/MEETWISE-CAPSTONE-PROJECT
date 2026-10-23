@@ -73,9 +73,6 @@ export default function EmployeeDetail() {
     : 0
   const promptText = VOICE_PROMPTS[promptIndex]
 
-  const [selectedFile, setSelectedFile] = useState<File | null>(null)
-  const [uploading, setUploading] = useState(false)
-
   // ── Fetch employee ──────────────────────────────────────────────────────────
   const {
     data: employee,
@@ -87,6 +84,10 @@ export default function EmployeeDetail() {
     enabled: !!id,
     staleTime: 30_000,
   })
+
+  const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [uploading, setUploading] = useState(false)
+  const [inputMode, setInputMode] = useState<'record' | 'upload'>('record')
 
   // ── Dropzone ────────────────────────────────────────────────────────────────
   const onDrop = useCallback((acceptedFiles: File[]) => {
@@ -107,14 +108,98 @@ export default function EmployeeDetail() {
     multiple: false,
   })
 
+  // Live recording state
+  const [isRecording, setIsRecording] = useState(false)
+  const [recordingSeconds, setRecordingSeconds] = useState(0)
+  const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null)
+  const [audioUrl, setAudioUrl] = useState<string | null>(null)
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const audioChunksRef = useRef<Blob[]>([])
+  const timerRef = useRef<any>(null)
+
+  const resetRecording = () => {
+    if (audioUrl) {
+      URL.revokeObjectURL(audioUrl)
+      setAudioUrl(null)
+    }
+    setRecordedBlob(null)
+    setRecordingSeconds(0)
+  }
+
+  const startRecording = async () => {
+    resetRecording()
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      let mimeType = 'audio/webm'
+      if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+        mimeType = 'audio/webm;codecs=opus'
+      } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+        mimeType = 'audio/mp4'
+      }
+
+      const mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined)
+      mediaRecorderRef.current = mediaRecorder
+      audioChunksRef.current = []
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data)
+        }
+      }
+
+      mediaRecorder.onstop = () => {
+        const type = mediaRecorder.mimeType || 'audio/webm'
+        const blob = new Blob(audioChunksRef.current, { type })
+        setRecordedBlob(blob)
+        setAudioUrl(URL.createObjectURL(blob))
+        stream.getTracks().forEach((track) => track.stop())
+      }
+
+      mediaRecorder.start(250)
+      setIsRecording(true)
+      setRecordingSeconds(0)
+
+      timerRef.current = setInterval(() => {
+        setRecordingSeconds((prev) => prev + 1)
+      }, 1000)
+    } catch (err: any) {
+      toast.error(err?.message || 'Microphone access denied or not available.')
+    }
+  }
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop()
+      setIsRecording(false)
+      if (timerRef.current) {
+        clearInterval(timerRef.current)
+      }
+    }
+  }
+
   // ── Upload handler ──────────────────────────────────────────────────────────
   async function handleUpload() {
-    if (!selectedFile || !id) return
+    if (!id) return
+
+    let fileToUpload: File | null = selectedFile
+
+    if (inputMode === 'record') {
+      if (!recordedBlob) return
+      const ext = recordedBlob.type.includes('mp4') ? 'm4a' : 'webm'
+      fileToUpload = new File([recordedBlob], `voice_${Date.now()}.${ext}`, {
+        type: recordedBlob.type,
+      })
+    }
+
+    if (!fileToUpload) return
+
     setUploading(true)
     try {
-      await employeesApi.uploadVoiceSample(id, selectedFile, promptText)
-      toast.success('Voice sample uploaded successfully!')
+      await employeesApi.uploadVoiceSample(id, fileToUpload, promptText)
+      toast.success('Voice sample enrolled successfully!')
       setSelectedFile(null)
+      resetRecording()
       refetch()
     } catch (err: any) {
       toast.error(
@@ -278,113 +363,213 @@ export default function EmployeeDetail() {
             </div>
           </div>
 
-          {/* Upload Voice Sample */}
+          {/* Voice Sample Enrollment Card */}
           <div className="card p-6">
             <h3 className="section-title mb-1 flex items-center gap-2">
-              <Upload className="w-4 h-4 text-brand-400" />
-              Upload Voice Sample
+              <Mic2 className="w-4 h-4 text-brand-400" />
+              Enroll Voice Sample
             </h3>
             <p className="muted text-sm mb-4">
-              Read the following sentence clearly and upload the recording:
+              Read the prompted sentence clearly to train the speaker recognition model:
             </p>
 
             {/* Prompt text */}
-            <div className="rounded-lg bg-slate-800/60 border border-slate-700 px-4 py-3 mb-5">
+            <div className="rounded-lg bg-slate-800/60 border border-slate-700 px-4 py-3 mb-4">
               <p className="text-slate-200 text-sm italic">
                 &ldquo;{promptText}&rdquo;
               </p>
             </div>
 
-            {/* Dropzone */}
-            <div
-              {...getRootProps()}
-              className={`rounded-xl border-2 border-dashed px-6 py-8 text-center cursor-pointer transition-colors ${
-                isDragActive
-                  ? 'border-brand-500 bg-brand-950/30'
-                  : 'border-slate-700 bg-slate-900/40 hover:border-brand-600 hover:bg-brand-950/20'
-              }`}
-            >
-              <input {...getInputProps()} />
-              <Mic2
-                className={`w-8 h-8 mx-auto mb-3 ${
-                  isDragActive ? 'text-brand-400' : 'text-slate-500'
+            {/* Mode switch */}
+            <div className="flex items-center gap-2 border-b border-slate-800 pb-3 mb-4">
+              <button
+                type="button"
+                onClick={() => setInputMode('record')}
+                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                  inputMode === 'record'
+                    ? 'bg-brand-500/20 text-brand-300 border border-brand-500/30'
+                    : 'text-slate-400 hover:text-slate-200'
                 }`}
-              />
-              {isDragActive ? (
-                <p className="text-brand-300 text-sm font-medium">
-                  Drop the audio file here…
-                </p>
-              ) : (
-                <>
-                  <p className="text-slate-300 text-sm font-medium">
-                    Drag &amp; drop an audio file here
-                  </p>
-                  <p className="text-slate-500 text-xs mt-1">
-                    or click to browse · .wav, .mp3, .webm, .m4a
-                  </p>
-                </>
-              )}
+              >
+                <Mic2 className="w-3.5 h-3.5 text-brand-400" />
+                Record Live on Device
+              </button>
+              <button
+                type="button"
+                onClick={() => setInputMode('upload')}
+                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                  inputMode === 'upload'
+                    ? 'bg-brand-500/20 text-brand-300 border border-brand-500/30'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <Upload className="w-3.5 h-3.5 text-slate-400" />
+                Upload Audio File
+              </button>
             </div>
 
-            {/* Selected file info */}
-            {selectedFile && (
-              <div className="mt-3 rounded-lg bg-slate-800 border border-slate-700 px-4 py-3 flex items-center justify-between gap-3">
-                <div className="flex items-center gap-2 min-w-0">
-                  <Mic2 className="w-4 h-4 text-brand-400 shrink-0" />
-                  <div className="min-w-0">
-                    <p className="text-sm text-slate-200 truncate">
-                      {selectedFile.name}
-                    </p>
-                    <p className="text-xs text-slate-500">
-                      {(selectedFile.size / 1024).toFixed(1)} KB
-                    </p>
+            {/* Tab 1: Live mic recorder */}
+            {inputMode === 'record' && (
+              <div className="rounded-xl border border-slate-700 bg-slate-900/50 p-6 text-center space-y-4">
+                {!isRecording && !recordedBlob && (
+                  <div className="space-y-3">
+                    <div className="w-14 h-14 rounded-full bg-brand-500/10 border border-brand-500/30 flex items-center justify-center mx-auto text-brand-400">
+                      <Mic2 className="w-7 h-7" />
+                    </div>
+                    <div>
+                      <p className="text-slate-200 text-sm font-semibold">Speak Into Microphone</p>
+                      <p className="text-slate-400 text-xs mt-1">
+                        Click Start, read the sentence above aloud, and stop when finished.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={startRecording}
+                      className="btn-primary inline-flex items-center gap-2 px-4 py-2 text-xs"
+                    >
+                      <Mic2 className="w-4 h-4" />
+                      Start Recording
+                    </button>
                   </div>
-                </div>
-                <button
-                  onClick={() => setSelectedFile(null)}
-                  className="text-slate-500 hover:text-slate-300 transition-colors shrink-0 text-xs"
-                >
-                  Remove
-                </button>
+                )}
+
+                {isRecording && (
+                  <div className="space-y-3 py-2">
+                    <div className="flex items-center justify-center gap-2">
+                      <span className="w-3 h-3 rounded-full bg-red-500 animate-pulse" />
+                      <span className="text-red-400 font-mono font-semibold text-base">
+                        Recording… {recordingSeconds}s
+                      </span>
+                    </div>
+                    <p className="text-slate-300 text-xs italic">Read the prompt aloud now…</p>
+                    <button
+                      type="button"
+                      onClick={stopRecording}
+                      className="bg-red-600 hover:bg-red-500 text-white font-medium rounded-lg px-5 py-2 text-xs shadow-lg inline-flex items-center gap-2 transition-colors"
+                    >
+                      <span className="w-2.5 h-2.5 bg-white rounded-sm" />
+                      Stop Recording
+                    </button>
+                  </div>
+                )}
+
+                {!isRecording && recordedBlob && (
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-center gap-1.5 text-emerald-400 font-medium text-xs">
+                      <CheckCircle className="w-4 h-4" />
+                      Recorded {recordingSeconds} seconds
+                    </div>
+                    {audioUrl && (
+                      <audio controls src={audioUrl} className="w-full h-9 rounded-lg mx-auto" />
+                    )}
+                    <div className="flex items-center justify-center gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={resetRecording}
+                        disabled={uploading}
+                        className="btn-secondary text-xs px-3 py-1.5"
+                      >
+                        Record Again
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleUpload}
+                        disabled={uploading}
+                        className="btn-primary flex items-center gap-1.5 text-xs px-4 py-1.5"
+                      >
+                        {uploading ? (
+                          <svg className="animate-spin w-3.5 h-3.5" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                          </svg>
+                        ) : (
+                          <Upload className="w-3.5 h-3.5" />
+                        )}
+                        {uploading ? 'Enrolling…' : 'Submit Voice Sample'}
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
-            {/* Upload button */}
-            <button
-              onClick={handleUpload}
-              disabled={!selectedFile || uploading}
-              className="btn-primary mt-4 w-full flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              {uploading ? (
-                <>
-                  <svg
-                    className="animate-spin w-4 h-4"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                  >
-                    <circle
-                      className="opacity-25"
-                      cx="12"
-                      cy="12"
-                      r="10"
-                      stroke="currentColor"
-                      strokeWidth="4"
-                    />
-                    <path
-                      className="opacity-75"
-                      fill="currentColor"
-                      d="M4 12a8 8 0 018-8v8H4z"
-                    />
-                  </svg>
-                  Uploading…
-                </>
-              ) : (
-                <>
-                  <Upload className="w-4 h-4" />
-                  Upload Sample
-                </>
-              )}
-            </button>
+            {/* Tab 2: Dropzone file upload */}
+            {inputMode === 'upload' && (
+              <>
+                <div
+                  {...getRootProps()}
+                  className={`rounded-xl border-2 border-dashed px-6 py-8 text-center cursor-pointer transition-colors ${
+                    isDragActive
+                      ? 'border-brand-500 bg-brand-950/30'
+                      : 'border-slate-700 bg-slate-900/40 hover:border-brand-600 hover:bg-brand-950/20'
+                  }`}
+                >
+                  <input {...getInputProps()} />
+                  <Mic2
+                    className={`w-8 h-8 mx-auto mb-3 ${
+                      isDragActive ? 'text-brand-400' : 'text-slate-500'
+                    }`}
+                  />
+                  {isDragActive ? (
+                    <p className="text-brand-300 text-sm font-medium">
+                      Drop the audio file here…
+                    </p>
+                  ) : (
+                    <>
+                      <p className="text-slate-300 text-sm font-medium">
+                        Drag &amp; drop an audio file here
+                      </p>
+                      <p className="text-slate-500 text-xs mt-1">
+                        or click to browse · .wav, .mp3, .webm, .m4a
+                      </p>
+                    </>
+                  )}
+                </div>
+
+                {selectedFile && (
+                  <div className="mt-3 rounded-lg bg-slate-800 border border-slate-700 px-4 py-3 flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <Mic2 className="w-4 h-4 text-brand-400 shrink-0" />
+                      <div className="min-w-0">
+                        <p className="text-sm text-slate-200 truncate">
+                          {selectedFile.name}
+                        </p>
+                        <p className="text-xs text-slate-500">
+                          {(selectedFile.size / 1024).toFixed(1)} KB
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => setSelectedFile(null)}
+                      className="text-slate-500 hover:text-slate-300 transition-colors shrink-0 text-xs"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                )}
+
+                <button
+                  onClick={handleUpload}
+                  disabled={!selectedFile || uploading}
+                  className="btn-primary mt-4 w-full flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed text-xs py-2"
+                >
+                  {uploading ? (
+                    <>
+                      <svg className="animate-spin w-4 h-4" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                      </svg>
+                      Uploading…
+                    </>
+                  ) : (
+                    <>
+                      <Upload className="w-4 h-4" />
+                      Upload File
+                    </>
+                  )}
+                </button>
+              </>
+            )}
           </div>
 
           {/* Meetings info card */}

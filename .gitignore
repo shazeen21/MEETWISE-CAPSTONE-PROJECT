@@ -34,8 +34,14 @@ data/transcripts/*
 data/reports/*
 !data/reports/.gitkeep
 data/chromadb/
+# Employee voice recordings are biometric personal data: never commit them.
+data/voice_samples/
 *.sqlite
 *.db
+*.db.bak*
+
+# Downloaded SpeechBrain weights (fetched automatically on first run)
+pretrained_models/
 
 # HuggingFace & Torch cache
 .cache/
@@ -47,3 +53,5 @@ huggingface/
 *.swp
 *.swo
 
+# macOS
+.DS_Store

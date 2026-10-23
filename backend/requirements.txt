@@ -27,6 +27,9 @@ torchaudio>=2.2.0
 whisperx>=3.1.1
 pyannote.audio>=3.1.1
 
+# Speaker Identification (ECAPA-TDNN voiceprints)
+speechbrain>=1.0.0
+
 # LLM Integration
 google-generativeai>=0.8.0
 google-genai>=1.0.0

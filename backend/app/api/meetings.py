@@ -49,6 +49,9 @@ async def upload_meeting_media(
     title: Optional[str] = Form(None, description="Optional custom meeting title"),
     source_type: str = Form("uploaded", description="Audio source: 'uploaded' or 'live'"),
     process_immediately: bool = Form(True, description="Whether to trigger the AI pipeline immediately"),
+    num_speakers: Optional[int] = Form(None, ge=1, le=20, description="Exact number of speakers, if known (best accuracy)"),
+    min_speakers: Optional[int] = Form(None, ge=1, le=20, description="Lower bound on number of speakers"),
+    max_speakers: Optional[int] = Form(None, ge=1, le=20, description="Upper bound on number of speakers"),
     db: Session = Depends(get_db),
     pipeline: MeetWisePipeline = Depends(get_pipeline),
 ):
@@ -68,7 +71,9 @@ async def upload_meeting_media(
 
     meeting_id = str(uuid.uuid4())
     safe_filename = f"{meeting_id}_{Path(file.filename).name}"
-    stored_media_path = Path(settings.AUDIO_DIR) / safe_filename
+    audio_dir = Path(settings.AUDIO_DIR)
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    stored_media_path = audio_dir / safe_filename
 
     # Save uploaded media safely
     try:
@@ -101,6 +106,9 @@ async def upload_meeting_media(
             meeting_id=meeting_id,
             title=title,
             source_type=source_type,
+            num_speakers=num_speakers,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
         )
         return {
             "status": "completed",
@@ -117,6 +125,9 @@ async def upload_meeting_media(
 @router.post("/{meeting_id}/process")
 def process_existing_meeting(
     meeting_id: str,
+    num_speakers: Optional[int] = Query(None, ge=1, le=20, description="Exact number of speakers, if known"),
+    min_speakers: Optional[int] = Query(None, ge=1, le=20),
+    max_speakers: Optional[int] = Query(None, ge=1, le=20),
     db: Session = Depends(get_db),
     pipeline: MeetWisePipeline = Depends(get_pipeline),
 ):
@@ -137,6 +148,9 @@ def process_existing_meeting(
             meeting_id=meeting.id,
             title=meeting.title,
             source_type=meeting.source_type,
+            num_speakers=num_speakers,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
         )
         return {"status": "completed", "meeting": result}
     except Exception as e:
@@ -165,6 +179,16 @@ def list_meetings(
             "summary": m.summary,
             "created_at": m.created_at.isoformat() if m.created_at else None,
             "speaker_count": len(m.speakers),
+            "speakers": [
+                {
+                    "id": s.id,
+                    "label": s.speaker_label,
+                    "name": s.speaker_name,
+                    "dominant_emotion": s.dominant_emotion,
+                    "detected_accent": s.detected_accent,
+                }
+                for s in m.speakers
+            ],
         }
         for m in meetings
     ]
@@ -209,8 +233,11 @@ def get_meeting_details(meeting_id: str, db: Session = Depends(get_db)):
                 "id": s.id,
                 "label": s.speaker_label,
                 "name": s.speaker_name,
+                "speaker_label": s.speaker_label,
+                "speaker_name": s.speaker_name,
                 "employee_id": s.employee_id,
                 "confidence": s.confidence_score,
+                "confidence_score": s.confidence_score,
                 "is_unknown": bool(s.is_unknown),
                 "detected_accent": s.detected_accent,
                 "dominant_emotion": s.dominant_emotion,

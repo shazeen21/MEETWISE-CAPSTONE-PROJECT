@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS meetings (
     summary TEXT,
     manager_summary TEXT,
     overall_sentiment TEXT,
+    status VARCHAR(50) NOT NULL DEFAULT 'completed' CHECK (status IN ('completed', 'degraded', 'failed')),
     created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 

@@ -2,7 +2,8 @@
 
 import json
 from pathlib import Path
-from backend.app.diarization.aligner import TranscriptAligner
+import pytest
+from backend.app.diarization.aligner import TranscriptAligner, AlignmentError
 
 
 def test_transcript_alignment(sample_asr_segments, sample_speaker_turns, tmp_path):
@@ -53,11 +54,8 @@ def test_consecutive_speaker_merging():
     assert aligned[0]["end"] == 3.5
 
 
-def test_empty_speaker_turns_fallback(sample_asr_segments):
-    """Verify alignment falls back gracefully to SPEAKER_00 when no turns are detected."""
+def test_empty_speaker_turns_raises(sample_asr_segments):
+    """No diarization turns must be an explicit error, never a silent single-speaker transcript."""
     aligner = TranscriptAligner()
-    aligned = aligner.align(sample_asr_segments, [])
-    assert len(aligned) == len(sample_asr_segments)
-    for item in aligned:
-        assert item["speaker"] == "SPEAKER_00"
-
+    with pytest.raises(AlignmentError):
+        aligner.align(sample_asr_segments, [])

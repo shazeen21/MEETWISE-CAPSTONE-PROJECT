@@ -187,6 +187,7 @@ class MeetingRepository:
         intelligence: MeetingIntelligence,
         speaker_identifications: Optional[Dict[str, Dict[str, Any]]] = None,
         media_type: str = "audio",
+        status: str = "completed",
     ) -> Meeting:
         """Persist full enterprise pipeline results atomically in one database transaction."""
         try:
@@ -213,6 +214,7 @@ class MeetingRepository:
                     summary=intelligence.summary,
                     manager_summary=manager_summary_json,
                     overall_sentiment=overall_sentiment_json,
+                    status=status,
                 )
                 self.db.add(meeting)
             else:
@@ -222,6 +224,13 @@ class MeetingRepository:
                 meeting.media_type = media_type
                 meeting.manager_summary = manager_summary_json
                 meeting.overall_sentiment = overall_sentiment_json
+                meeting.status = status
+
+                # Reprocessing replaces the previous results instead of appending a
+                # second transcript / set of decisions next to the old speakers.
+                for model in (Transcript, ActionItemModel, DecisionModel, Topic, Keyword, EmployeeReport, Speaker):
+                    self.db.query(model).filter(model.meeting_id == meeting_id).delete(synchronize_session=False)
+                self.db.flush()
 
             # 2. Extract and create speakers with biometric recognition metadata
             unique_speakers = sorted(list(set(seg["speaker"] for seg in aligned_segments if "speaker" in seg)))
@@ -230,9 +239,10 @@ class MeetingRepository:
             for spk_label in unique_speakers:
                 id_info = speaker_identifications.get(spk_label, {})
                 recognized_name = id_info.get("name") or spk_label
-                confidence = float(id_info.get("confidence", 1.0))
+                # No identification result means the speaker was never verified by voice.
+                confidence = float(id_info.get("confidence", 0.0))
                 emp_id_fk = id_info.get("employee_id")
-                is_unknown = 1 if id_info.get("is_unknown", False) else 0
+                is_unknown = 1 if id_info.get("is_unknown", True) else 0
                 accent = id_info.get("accent")
                 emotion = id_info.get("dominant_emotion")
 

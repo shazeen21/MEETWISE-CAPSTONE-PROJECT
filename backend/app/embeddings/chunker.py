@@ -26,7 +26,7 @@ class TranscriptChunk(BaseModel):
 class TranscriptChunker:
     """Chunking engine designed for conversational meeting transcripts."""
 
-    def __init__(self, target_chunk_words: int = 150, overlap_turns: int = 1):
+    def __init__(self, target_chunk_words: int = 400, overlap_turns: int = 2):
         self.target_chunk_words = target_chunk_words
         self.overlap_turns = overlap_turns
 

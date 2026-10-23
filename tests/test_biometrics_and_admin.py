@@ -11,6 +11,31 @@ from backend.app.speakers.voice_biometrics import (
 client = TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def isolated_db():
+    """Run API calls against an in-memory database, never the real data/meetwise.db."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+    from backend.app.database.connection import get_db
+    from backend.app.database.models import Base
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(bind=engine)
+    TestingSession = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    def _get_test_db():
+        db = TestingSession()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = _get_test_db
+    yield
+    app.dependency_overrides.pop(get_db, None)
+
+
 def test_voice_biometrics_feature_extraction():
     service = VoiceBiometricsService()
     sample_rate = 16000

@@ -16,6 +16,57 @@ from typing import List, Optional, Dict, Any, Union
 from pydantic import BaseModel, Field, field_validator
 
 
+# Canonical emotion labels used by the LLM prompt, the database, and the UI charts.
+EMOTION_TAXONOMY = [
+    "joy",
+    "excitement",
+    "satisfaction",
+    "neutral",
+    "confusion",
+    "anxiety",
+    "frustration",
+    "anger",
+    "sadness",
+    "disappointment",
+]
+
+# Valence used to derive positive / neutral / negative sentiment from emotions.
+EMOTION_VALENCE = {
+    "joy": "positive",
+    "excitement": "positive",
+    "satisfaction": "positive",
+    "neutral": "neutral",
+    "confusion": "neutral",
+    "anxiety": "negative",
+    "frustration": "negative",
+    "anger": "negative",
+    "sadness": "negative",
+    "disappointment": "negative",
+}
+
+# Common synonyms the LLM (or older data) may produce, mapped onto the taxonomy.
+_EMOTION_SYNONYMS = {
+    "happy": "joy", "happiness": "joy", "cheerful": "joy", "pleased": "satisfaction",
+    "content": "satisfaction", "satisfied": "satisfaction", "relieved": "satisfaction",
+    "confident": "satisfaction", "excited": "excitement", "enthusiastic": "excitement",
+    "enthusiasm": "excitement", "calm": "neutral", "professional": "neutral",
+    "formal": "neutral", "objective": "neutral", "confused": "confusion", "uncertain": "confusion",
+    "anxious": "anxiety", "worried": "anxiety", "nervous": "anxiety", "concerned": "anxiety",
+    "stressed": "anxiety", "fear": "anxiety", "frustrated": "frustration", "irritated": "frustration",
+    "annoyed": "frustration", "impatient": "frustration", "angry": "anger", "furious": "anger",
+    "sad": "sadness", "depressed": "sadness", "down": "sadness", "low": "sadness", "unhappy": "sadness",
+    "disappointed": "disappointment", "discouraged": "disappointment",
+}
+
+
+def normalize_emotion(label: Optional[str]) -> str:
+    """Map any emotion label onto EMOTION_TAXONOMY (unknown labels become 'neutral')."""
+    key = (label or "").strip().lower()
+    if key in EMOTION_VALENCE:
+        return key
+    return _EMOTION_SYNONYMS.get(key, "neutral")
+
+
 class ActionItem(BaseModel):
     """Action item assigned during the meeting with priority."""
     task: str = Field(..., description="Actionable task or deliverable")
@@ -23,12 +74,17 @@ class ActionItem(BaseModel):
     deadline: Optional[str] = Field(default="Not specified", description="Deadline or target completion date")
     priority: str = Field(default="Medium", description="Priority: High, Medium, Low")
     status: str = Field(default="pending", description="Status: pending, in_progress, completed")
+    evidence: Optional[str] = Field(default=None, description="Direct quote from transcript as evidence")
+    confidence: float = Field(default=1.0, description="LLM confidence in this extraction (0.0-1.0)")
+
 
 
 class DecisionItem(BaseModel):
     """Decision reached during the meeting."""
     decision: str = Field(..., description="Description of the agreed decision")
     timestamp: Optional[str] = Field(default=None, description="Approximate time or context when decided")
+    evidence: Optional[str] = Field(default=None, description="Direct quote from transcript as evidence")
+    confidence: float = Field(default=1.0, description="LLM confidence in this extraction (0.0-1.0)")
 
 
 class TopicItem(BaseModel):
@@ -53,12 +109,27 @@ class KeywordItem(BaseModel):
 class EmotionItem(BaseModel):
     """Per-speaker emotion and speaking style assessment."""
     speaker: str = Field(..., description="Speaker identifier or employee name")
-    dominant_emotion: str = Field(
-        default="neutral",
-        description="Emotion: neutral, happy, excited, sad, angry, frustrated, concerned, nervous, confident, empathetic, professional",
-    )
+    dominant_emotion: str = Field(default="neutral", description=f"One of: {', '.join(EMOTION_TAXONOMY)}")
     speaking_style: str = Field(default="professional", description="Speaking style (e.g. collaborative, assertive, hesitant, formal)")
     confidence: float = Field(default=0.9, description="Confidence score 0.0 to 1.0")
+    evidence: Optional[str] = Field(default=None, description="Quote from transcript supporting this emotion")
+
+    @field_validator("dominant_emotion", mode="before")
+    @classmethod
+    def _normalize(cls, v):
+        return normalize_emotion(v)
+
+
+class SegmentEmotion(BaseModel):
+    """Emotion expressed in one numbered transcript segment."""
+    segment: int = Field(..., description="Index of the transcript segment ([#n] in the prompt)")
+    emotion: str = Field(default="neutral", description=f"One of: {', '.join(EMOTION_TAXONOMY)}")
+    intensity: float = Field(default=0.5, ge=0.0, le=1.0, description="Strength of the emotion 0.0-1.0")
+
+    @field_validator("emotion", mode="before")
+    @classmethod
+    def _normalize(cls, v):
+        return normalize_emotion(v)
 
 
 class SentimentAnalysis(BaseModel):
@@ -113,6 +184,7 @@ class MeetingIntelligence(BaseModel):
     action_items: List[ActionItem] = Field(default_factory=list, description="Action items with owner, deadline, and priority")
     keywords: List[KeywordItem] = Field(default_factory=list, description="Ranked and categorized keywords")
     emotions: List[EmotionItem] = Field(default_factory=list, description="Per-speaker emotion and style assessments")
+    segment_emotions: List[SegmentEmotion] = Field(default_factory=list, description="Emotion of each transcript segment")
     sentiment_analysis: Optional[SentimentAnalysis] = Field(default=None, description="Overall meeting sentiment dynamics")
     accents: List[AccentItem] = Field(default_factory=list, description="Detected speaker accents")
     employee_reports: List[EmployeeSpecificReport] = Field(default_factory=list, description="Personalized attendee reports")

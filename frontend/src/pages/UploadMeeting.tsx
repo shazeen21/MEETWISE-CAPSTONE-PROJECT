@@ -52,6 +52,7 @@ export default function UploadMeeting() {
   // Form state
   const [file, setFile] = useState<File | null>(null)
   const [title, setTitle] = useState('')
+  const [numSpeakers, setNumSpeakers] = useState('')
   const [sourceType, setSourceType] = useState<'uploaded' | 'live'>('uploaded')
   const [processImmediately, setProcessImmediately] = useState(true)
 
@@ -117,6 +118,7 @@ export default function UploadMeeting() {
     const formData = new FormData()
     formData.append('file', file)
     if (title.trim()) formData.append('title', title.trim())
+    if (numSpeakers.trim()) formData.append('num_speakers', numSpeakers.trim())
     formData.append('source_type', sourceType)
     formData.append('process_immediately', String(processImmediately))
 
@@ -225,6 +227,24 @@ export default function UploadMeeting() {
               placeholder="e.g. Q3 Sprint Planning"
               value={title}
               onChange={e => setTitle(e.target.value)}
+              disabled={isUploading}
+            />
+          </div>
+
+          {/* Speaker count: the strongest hint for accurate diarization */}
+          <div>
+            <label htmlFor="num-speakers" className="label">
+              Number of Speakers <span className="text-slate-500 font-normal">(optional, improves accuracy)</span>
+            </label>
+            <input
+              id="num-speakers"
+              type="number"
+              min={1}
+              max={20}
+              className="input w-full mt-1"
+              placeholder="Leave empty to detect automatically"
+              value={numSpeakers}
+              onChange={e => setNumSpeakers(e.target.value)}
               disabled={isUploading}
             />
           </div>

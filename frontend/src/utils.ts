@@ -52,18 +52,18 @@ export function statusColor(status: string): string {
 }
 
 export function emotionColor(emotion: string): string {
+  // Keep in sync with EMOTION_TAXONOMY in backend/app/meeting_intelligence/schemas.py
   const map: Record<string, string> = {
-    happy: 'text-yellow-400',
-    excited: 'text-orange-400',
-    confident: 'text-emerald-400',
-    empathetic: 'text-teal-400',
-    professional: 'text-blue-400',
+    joy: 'text-yellow-400',
+    excitement: 'text-orange-400',
+    satisfaction: 'text-emerald-400',
     neutral: 'text-slate-400',
-    concerned: 'text-amber-400',
-    nervous: 'text-violet-400',
-    frustrated: 'text-red-400',
-    angry: 'text-red-500',
-    sad: 'text-slate-500',
+    confusion: 'text-sky-400',
+    anxiety: 'text-violet-400',
+    frustration: 'text-red-400',
+    anger: 'text-red-500',
+    sadness: 'text-indigo-400',
+    disappointment: 'text-amber-400',
   }
   return map[emotion?.toLowerCase()] ?? 'text-slate-400'
 }

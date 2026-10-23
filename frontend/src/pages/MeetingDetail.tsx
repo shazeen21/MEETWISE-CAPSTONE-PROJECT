@@ -136,8 +136,11 @@ function OverviewTab({ meeting }: { meeting: any }) {
                 </div>
                 <div className="flex flex-wrap gap-2 mt-1">
                   {sp.confidence_score != null && (
-                    <span className="badge badge-blue text-xs">
-                      {Math.round(sp.confidence_score * 100)}% conf.
+                    <span
+                      className="badge badge-blue text-xs"
+                      title="ECAPA-TDNN cosine similarity to the enrolled voiceprint (match threshold 0.25)"
+                    >
+                      voice match {sp.confidence_score.toFixed(2)}
                     </span>
                   )}
                   {sp.detected_accent && (
@@ -542,7 +545,7 @@ function AnalyticsTab({ meetingId }: { meetingId: string }) {
   const emotionData = data.overall_sentiment?.emotions_breakdown
     ? Object.entries(data.overall_sentiment.emotions_breakdown).map(([name, value]) => ({
         name,
-        value: Math.round((value as number) * 100),
+        value: Math.round(value as number),
       }))
     : []
 
@@ -640,7 +643,7 @@ function AnalyticsTab({ meetingId }: { meetingId: string }) {
               <XAxis dataKey="name" tick={{ fill: '#94a3b8', fontSize: 11 }} />
               <YAxis tick={{ fill: '#94a3b8', fontSize: 11 }} />
               <Tooltip content={<DarkTooltip />} />
-              <Bar dataKey="value" name="Score" radius={[4, 4, 0, 0]}>
+              <Bar dataKey="value" name="Percentage (%)" radius={[4, 4, 0, 0]}>
                 {emotionData.map((_, i) => (
                   <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />
                 ))}
@@ -664,7 +667,7 @@ function AnalyticsTab({ meetingId }: { meetingId: string }) {
               <tr className="border-b border-slate-800">
                 <th className="text-left px-4 py-3 text-xs text-slate-400 font-medium">Speaker</th>
                 <th className="text-left px-4 py-3 text-xs text-slate-400 font-medium">Speaking Time</th>
-                <th className="text-left px-4 py-3 text-xs text-slate-400 font-medium">Confidence</th>
+                <th className="text-left px-4 py-3 text-xs text-slate-400 font-medium">Voice match</th>
                 <th className="text-left px-4 py-3 text-xs text-slate-400 font-medium">Accent</th>
                 <th className="text-left px-4 py-3 text-xs text-slate-400 font-medium">Emotion</th>
               </tr>
@@ -675,7 +678,7 @@ function AnalyticsTab({ meetingId }: { meetingId: string }) {
                   <td className="px-4 py-3 font-medium text-slate-200">{sp.name}</td>
                   <td className="px-4 py-3 text-slate-400">{formatDuration(sp.speaking_time)}</td>
                   <td className="px-4 py-3 text-slate-400">
-                    {sp.confidence != null ? `${Math.round(sp.confidence * 100)}%` : '—'}
+                    {sp.confidence != null ? sp.confidence.toFixed(2) : '—'}
                   </td>
                   <td className="px-4 py-3">
                     {sp.accent ? (

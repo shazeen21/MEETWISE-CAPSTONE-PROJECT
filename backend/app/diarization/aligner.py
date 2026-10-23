@@ -12,6 +12,9 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
+class AlignmentError(Exception):
+    """Exception raised when transcript alignment fails due to missing diarization data."""
+    pass
 
 class AlignedSegment(BaseModel):
     """Unified speaker-attributed transcript segment."""
@@ -50,19 +53,9 @@ class TranscriptAligner:
         if not asr_segments:
             return []
 
-        # If no speaker turns were detected, default to SPEAKER_00
+        # If no speaker turns were detected, fail explicitly
         if not speaker_turns:
-            logger.warning("No speaker turns provided. Assigning all segments to SPEAKER_00.")
-            return [
-                {
-                    "speaker": "SPEAKER_00",
-                    "start": round(seg["start"], 2),
-                    "end": round(seg["end"], 2),
-                    "text": seg["text"].strip(),
-                }
-                for seg in asr_segments
-                if seg.get("text", "").strip()
-            ]
+            raise AlignmentError("No speaker turns provided. Cannot align transcript.")
 
         raw_aligned: List[Dict[str, Any]] = []
 
@@ -86,29 +79,33 @@ class TranscriptAligner:
         asr_segments: List[Dict[str, Any]],
         speaker_turns: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Assign speaker to each segment by highest overlap."""
+        """Assign speaker to each segment. If a segment spans multiple speaker turns,
+        it is split into sub-segments to preserve speaker attribution."""
         aligned = []
-        last_known_speaker = speaker_turns[0]["speaker"] if speaker_turns else "SPEAKER_00"
 
         for seg in asr_segments:
             s_start = float(seg["start"])
             s_end = float(seg["end"])
             text = seg.get("text", "").strip()
-
             if not text:
                 continue
 
-            best_speaker = None
-            max_overlap = 0.0
-
+            # Find all turns that overlap with this segment
+            overlaps = []
             for turn in speaker_turns:
-                overlap = self._compute_overlap(s_start, s_end, turn["start"], turn["end"])
-                if overlap > max_overlap:
-                    max_overlap = overlap
-                    best_speaker = turn["speaker"]
+                overlap_start = max(s_start, turn["start"])
+                overlap_end = min(s_end, turn["end"])
+                if overlap_start < overlap_end:
+                    overlaps.append({
+                        "speaker": turn["speaker"],
+                        "start": overlap_start,
+                        "end": overlap_end,
+                        "duration": overlap_end - overlap_start
+                    })
 
-            # Fallback if segment didn't overlap any turn: find the temporally closest turn
-            if best_speaker is None:
+            if not overlaps:
+                # Fallback: find the closest turn
+                best_speaker = "SPEAKER_00"
                 min_dist = float("inf")
                 for turn in speaker_turns:
                     dist = min(abs(s_start - turn["end"]), abs(turn["start"] - s_end))
@@ -116,13 +113,28 @@ class TranscriptAligner:
                         min_dist = dist
                         best_speaker = turn["speaker"]
 
-                if best_speaker is None:
-                    best_speaker = last_known_speaker
+                aligned.append({
+                    "speaker": best_speaker,
+                    "start": round(s_start, 2),
+                    "end": round(s_end, 2),
+                    "text": text,
+                })
+                continue
 
-            last_known_speaker = best_speaker
+            # If only one speaker overlaps, assign it
+            if len(overlaps) == 1:
+                aligned.append({
+                    "speaker": overlaps[0]["speaker"],
+                    "start": round(s_start, 2),
+                    "end": round(s_end, 2),
+                    "text": text,
+                })
+                continue
 
+            # If multiple speakers overlap, assign to the one with the most overlap
+            best_turn = max(overlaps, key=lambda x: x["duration"])
             aligned.append({
-                "speaker": best_speaker,
+                "speaker": best_turn["speaker"],
                 "start": round(s_start, 2),
                 "end": round(s_end, 2),
                 "text": text,
@@ -159,7 +171,7 @@ class TranscriptAligner:
             return []
 
         # Assign speaker to each word
-        last_speaker = speaker_turns[0]["speaker"] if speaker_turns else "SPEAKER_00"
+        last_speaker = speaker_turns[0]["speaker"]
         assigned_words = []
 
         for item in word_list:
@@ -273,4 +285,3 @@ class TranscriptAligner:
 
         logger.info(f"Saved aligned transcript to {output_file_path}")
         return str(out_path)
-

@@ -29,6 +29,8 @@ from .schemas import (
     AccentItem,
     EmployeeSpecificReport,
     ManagerExecutiveSummary,
+    EMOTION_TAXONOMY,
+    EMOTION_VALENCE,
 )
 
 logger = logging.getLogger(__name__)
@@ -101,12 +103,12 @@ class GeminiIntelligenceService:
     def format_transcript_for_llm(aligned_segments: List[Dict[str, Any]]) -> str:
         """Format speaker-labelled segments into clean text for LLM ingestion."""
         lines = []
-        for seg in aligned_segments:
+        for idx, seg in enumerate(aligned_segments):
             speaker = seg.get("speaker", "UNKNOWN")
             start = seg.get("start", 0.0)
             text = seg.get("text", "").strip()
             m_s = f"{int(start // 60):02d}:{int(start % 60):02d}"
-            lines.append(f"[{m_s}] {speaker}: {text}")
+            lines.append(f"[#{idx} {m_s}] {speaker}: {text}")
 
         return "\n".join(lines)
 
@@ -123,6 +125,113 @@ class GeminiIntelligenceService:
             return brace_match.group(1).strip()
 
         return text
+
+    @staticmethod
+    def _normalize_for_match(text: str) -> str:
+        """Lowercase, drop punctuation and collapse whitespace so quotes match despite formatting."""
+        text = re.sub(r"[^\w\s']", " ", (text or "").lower())
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _verify_evidence(self, intelligence: MeetingIntelligence, aligned_segments: List[Dict[str, Any]]) -> MeetingIntelligence:
+        """Drop decisions / action items whose quoted evidence is not in the transcript.
+
+        The quote must appear verbatim (ignoring case and punctuation) in the spoken
+        text. Items without a verifiable quote are removed rather than shown to users
+        with a hidden low confidence score.
+        """
+        spoken = self._normalize_for_match(" ".join(seg.get("text", "") for seg in aligned_segments))
+
+        def verified(evidence: Optional[str]) -> bool:
+            quote = self._normalize_for_match(evidence or "")
+            return len(quote.split()) >= 2 and quote in spoken
+
+        kept_actions = []
+        for item in intelligence.action_items:
+            if verified(item.evidence):
+                kept_actions.append(item)
+            else:
+                logger.warning(f"Dropping action item without verbatim evidence: {item.task!r} (evidence={item.evidence!r})")
+        intelligence.action_items = kept_actions
+
+        kept_decisions = []
+        for item in intelligence.decisions:
+            if verified(item.evidence):
+                kept_decisions.append(item)
+            else:
+                logger.warning(f"Dropping decision without verbatim evidence: {item.decision!r} (evidence={item.evidence!r})")
+        intelligence.decisions = kept_decisions
+
+        for item in intelligence.emotions:
+            if not verified(item.evidence):
+                item.confidence = 0.0
+                item.evidence = None
+
+        return intelligence
+
+    @staticmethod
+    def _derive_sentiment(intelligence: MeetingIntelligence, aligned_segments: List[Dict[str, Any]]) -> MeetingIntelligence:
+        """Compute emotion distribution and sentiment from per-segment labels.
+
+        Percentages are weighted by how long each segment was spoken, so the charts
+        reflect what was actually said instead of numbers invented by the LLM.
+        """
+        labels = {se.segment: se.emotion for se in intelligence.segment_emotions if 0 <= se.segment < len(aligned_segments)}
+        totals: Dict[str, float] = {}
+        per_speaker: Dict[str, Dict[str, float]] = {}
+        for idx, seg in enumerate(aligned_segments):
+            emotion = labels.get(idx, "neutral")
+            weight = max(float(seg.get("end", 0.0)) - float(seg.get("start", 0.0)), 0.1)
+            totals[emotion] = totals.get(emotion, 0.0) + weight
+            spk = per_speaker.setdefault(seg.get("speaker", "UNKNOWN"), {})
+            spk[emotion] = spk.get(emotion, 0.0) + weight
+
+        grand = sum(totals.values()) or 1.0
+        breakdown = {e: round(100.0 * totals[e] / grand, 1) for e in EMOTION_TAXONOMY if totals.get(e)}
+        valence = {"positive": 0.0, "neutral": 0.0, "negative": 0.0}
+        for e, pct in breakdown.items():
+            valence[EMOTION_VALENCE[e]] += pct
+
+        if valence["negative"] >= 40:
+            overall = "negative"
+        elif valence["negative"] >= 20:
+            overall = "concerned"
+        elif valence["positive"] > valence["negative"] and valence["positive"] >= 20:
+            overall = "positive"
+        else:
+            overall = "neutral"
+
+        moments = intelligence.sentiment_analysis.key_emotional_moments if intelligence.sentiment_analysis else []
+        intelligence.sentiment_analysis = SentimentAnalysis(
+            overall_sentiment=overall,
+            positive_percentage=round(valence["positive"], 1),
+            neutral_percentage=round(valence["neutral"], 1),
+            negative_percentage=round(valence["negative"], 1),
+            emotions_breakdown=breakdown,
+            key_emotional_moments=moments,
+        )
+
+        # A speaker's dominant emotion is what they expressed most, by speaking time.
+        by_speaker = {e.speaker: e for e in intelligence.emotions}
+        for spk, dist in per_speaker.items():
+            dominant = max(dist, key=dist.get)
+            if spk in by_speaker:
+                by_speaker[spk].dominant_emotion = dominant
+            else:
+                intelligence.emotions.append(EmotionItem(speaker=spk, dominant_emotion=dominant, confidence=0.0))
+        return intelligence
+
+    def _parse_response(self, raw_text: str, aligned_segments: List[Dict[str, Any]]) -> MeetingIntelligence:
+        """Parse Gemini JSON, validate against the schema, and apply grounding checks."""
+        cleaned_json_text = self.clean_json_response(raw_text)
+        try:
+            data = json.loads(cleaned_json_text)
+        except json.JSONDecodeError as json_err:
+            logger.error(f"JSON decode failed on Gemini output: {raw_text}")
+            raise LLMIntelligenceError(f"Malformed JSON returned by Gemini: {json_err}")
+
+        intelligence = MeetingIntelligence(**data)
+        intelligence = self._verify_evidence(intelligence, aligned_segments)
+        return self._derive_sentiment(intelligence, aligned_segments)
 
     def analyze(
         self,
@@ -154,6 +263,9 @@ class GeminiIntelligenceService:
         if custom_keywords:
             kw_context = f"\nADMIN CONFIGURED KEYWORDS TO TRACK: {', '.join(custom_keywords)}\n"
 
+        emotion_choices = " | ".join(EMOTION_TAXONOMY)
+        emotion_list = ", ".join(EMOTION_TAXONOMY)
+
         prompt = f"""You are an elite Enterprise Meeting Intelligence & Organizational Memory AI for MeetWise.
 Analyze the following multi-speaker meeting transcript recorded in a conference room or video call.
 {emp_context}{kw_context}
@@ -175,7 +287,9 @@ You must extract an exhaustive intelligence payload strictly conforming to this 
     "decisions": [
         {{
             "decision": "Specific agreement or decision reached",
-            "timestamp": "Timestamp mm:ss or null"
+            "timestamp": "Timestamp mm:ss or null",
+            "evidence": "Direct quote from the transcript supporting this decision",
+            "confidence": 0.95
         }}
     ],
     "action_items": [
@@ -184,7 +298,9 @@ You must extract an exhaustive intelligence payload strictly conforming to this 
             "owner": "Person responsible (use known employee name if matched, else speaker label)",
             "deadline": "Deadline or target date (e.g. Friday, Next sprint, or 'Not specified')",
             "priority": "High | Medium | Low",
-            "status": "pending"
+            "status": "pending",
+            "evidence": "Direct quote from the transcript where this task was assigned",
+            "confidence": 0.9
         }}
     ],
     "keywords": [
@@ -194,21 +310,20 @@ You must extract an exhaustive intelligence payload strictly conforming to this 
             "relevance_score": 0.95
         }}
     ],
+    "segment_emotions": [
+        {{"segment": 0, "emotion": "{emotion_choices}", "intensity": 0.6}}
+    ],
     "emotions": [
         {{
-            "speaker": "Speaker Name or Label",
-            "dominant_emotion": "neutral | happy | excited | sad | angry | frustrated | concerned | nervous | confident | empathetic | professional",
+            "speaker": "Speaker label exactly as written in the transcript",
+            "dominant_emotion": "{emotion_choices}",
             "speaking_style": "assertive | collaborative | hesitant | formal | authoritative",
-            "confidence": 0.9
+            "confidence": 0.9,
+            "evidence": "Verbatim words from this speaker that show the emotion"
         }}
     ],
     "sentiment_analysis": {{
-        "overall_sentiment": "positive | neutral | concerned | negative",
-        "positive_percentage": 25.0,
-        "neutral_percentage": 65.0,
-        "negative_percentage": 10.0,
-        "emotions_breakdown": {{"professional": 50.0, "confident": 30.0, "concerned": 20.0}},
-        "key_emotional_moments": ["Brief note on any tension, agreement, or enthusiasm"]
+        "key_emotional_moments": ["[#segment] what happened, e.g. '[#14] SPEAKER_01 frustrated about the delayed release'"]
     }},
     "accents": [
         {{
@@ -241,10 +356,14 @@ You must extract an exhaustive intelligence payload strictly conforming to this 
 }}
 
 GUIDELINES:
-1. Map tasks and owners accurately to the actual speaker who committed to or was assigned the task.
-2. Ensure every participant in the transcript has an entry in employee_reports, emotions, and accents.
-3. Categorize keywords into appropriate business buckets: product, client, risk, budget, hiring, revenue, deadline, deliverable, custom.
-4. Output ONLY valid JSON with no extraneous markdown or conversational filler.
+1. SPEAKERS: Refer to speakers exactly as labelled in the transcript (e.g. "SPEAKER_01", "Unknown Speaker", or a name). Never rename a speaker label to a person's name, and never attribute words to someone who does not appear as a label.
+2. Map tasks and owners to the speaker who committed to or was assigned the task. If the owner is not stated, use "Unassigned".
+3. EVIDENCE REQUIREMENT: For every Decision and Action Item, "evidence" MUST be copied word-for-word from the transcript text (at least a few words, without the [#n mm:ss] prefix). Items whose evidence cannot be found in the transcript are automatically discarded, so do not paraphrase and do not invent items that were not said.
+4. CONFIDENCE SCORING: Assign a confidence score (0.0-1.0). Use 1.0 for verbatim commitments, lower for inferred agreements.
+5. EMOTIONS: Return one "segment_emotions" entry for EVERY numbered segment [#n]. Choose exactly one of: {emotion_list}. Judge from the words and context: e.g. complaints about blockers or repeated problems -> frustration; worry about deadlines or risk -> anxiety; low, hopeless or discouraged remarks -> sadness; unmet expectations -> disappointment; praise, laughter or good news -> joy; plain status updates -> neutral. Do not default to neutral when the words clearly express an emotion, and do not invent emotion when the words are plain.
+6. Ensure every speaker label in the transcript has an entry in employee_reports, emotions, and accents.
+7. Categorize keywords into appropriate business buckets: product, client, risk, budget, hiring, revenue, deadline, deliverable, custom.
+8. Output ONLY valid JSON with no extraneous markdown or conversational filler.
 
 TRANSCRIPT:
 {formatted_transcript}
@@ -260,16 +379,8 @@ TRANSCRIPT:
                 },
             )
 
-            raw_text = response.text
-            cleaned_json_text = self.clean_json_response(raw_text)
+            intelligence = self._parse_response(response.text, aligned_segments)
 
-            try:
-                data = json.loads(cleaned_json_text)
-            except json.JSONDecodeError as json_err:
-                logger.error(f"JSON decode failed on Gemini output: {raw_text}")
-                raise LLMIntelligenceError(f"Malformed JSON returned by Gemini: {json_err}")
-
-            intelligence = MeetingIntelligence(**data)
             logger.info(
                 f"Successfully extracted enterprise intelligence: '{intelligence.title}' with "
                 f"{len(intelligence.action_items)} actions, {len(intelligence.topics)} topics, "
@@ -296,10 +407,8 @@ TRANSCRIPT:
                             "response_mime_type": "application/json",
                         },
                     )
-                    raw_text = response.text
-                    cleaned_json_text = self.clean_json_response(raw_text)
-                    data = json.loads(cleaned_json_text)
-                    intelligence = MeetingIntelligence(**data)
+                    intelligence = self._parse_response(response.text, aligned_segments)
+
                     self._client = alt_model
                     self.model_name = candidate_name
                     return intelligence

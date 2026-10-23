@@ -102,6 +102,7 @@ class Meeting(Base):
     summary = Column(Text, nullable=True)
     manager_summary = Column(Text, nullable=True)  # JSON-encoded 1-page executive brief
     overall_sentiment = Column(Text, nullable=True)  # JSON-encoded sentiment analytics
+    status = Column(String(50), default="completed", nullable=False)  # completed, degraded, failed
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     # Relationships with CASCADE delete

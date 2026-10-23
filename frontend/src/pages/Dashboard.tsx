@@ -291,9 +291,10 @@ export default function Dashboard() {
                       </span>
                       <span className="flex items-center gap-1 text-xs text-slate-400">
                         <Users className="w-3 h-3" />
-                        {m.speakers.length} speaker{m.speakers.length !== 1 ? 's' : ''}
+                        {m.speakers?.length ?? (m as any).speaker_count ?? 0} speaker
+                        {(m.speakers?.length ?? (m as any).speaker_count ?? 0) !== 1 ? 's' : ''}
                       </span>
-                      {m.speakers.some((s) => s.dominant_emotion) && (
+                      {m.speakers && m.speakers.length > 0 && m.speakers.some((s) => s.dominant_emotion) && (
                         <span
                           className={`text-xs font-medium ${emotionColor(
                             m.speakers[0]?.dominant_emotion ?? 'neutral'
@@ -348,12 +349,20 @@ export default function Dashboard() {
               <div>
                 <HealthRow
                   label="Database"
-                  value={health?.database ?? (dbOk ? 'Connected' : 'Unknown')}
+                  value={
+                    typeof health?.database === 'string'
+                      ? health.database
+                      : health?.database?.status ?? (dbOk ? 'Connected' : 'Unknown')
+                  }
                   ok={dbOk}
                 />
                 <HealthRow
                   label="Vector Store"
-                  value={health?.vector_store ?? (vectorOk ? 'Connected' : 'Unknown')}
+                  value={
+                    typeof health?.vector_store === 'string'
+                      ? health.vector_store
+                      : health?.vector_store?.status ?? (vectorOk ? 'Connected' : 'Unknown')
+                  }
                   ok={vectorOk}
                 />
                 <HealthRow

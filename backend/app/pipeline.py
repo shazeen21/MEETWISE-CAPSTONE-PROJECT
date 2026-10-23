@@ -26,14 +26,14 @@ from .config import settings
 from .audio.preprocessor import AudioPreprocessor
 from .transcription.whisperx_service import WhisperXService
 from .diarization.pyannote_service import PyannoteService
-from .diarization.aligner import TranscriptAligner
+from .diarization.aligner import TranscriptAligner, AlignmentError
 from .meeting_intelligence.gemini_service import GeminiIntelligenceService
 from .meeting_intelligence.schemas import MeetingIntelligence
 from .embeddings.chunker import TranscriptChunker
 from .embeddings.bge_service import BGEEmbeddingService
 from .vector_store.chroma_service import ChromaService
 from .database.repository import MeetingRepository
-from .speakers.voice_biometrics import VoiceBiometricsService, SpeakerRecognitionEngine
+from .speakers.voice_biometrics import VoiceBiometricsService, SpeakerRecognitionEngine, VoiceEmbeddingError
 from .reports.pdf_generator import MOMPDFGenerator
 from .notifications.dispatcher import NotificationDispatcher
 
@@ -76,6 +76,7 @@ class MeetWisePipeline:
         # 3. Diarization
         self.pyannote = pyannote_service or PyannoteService(
             hf_token=settings.HF_TOKEN,
+            pipeline_name=settings.DIARIZATION_MODEL,
             device=settings.WHISPER_DEVICE,
         )
 
@@ -143,10 +144,14 @@ class MeetWisePipeline:
         meeting_id: Optional[str] = None,
         title: Optional[str] = None,
         source_type: str = "uploaded",
+        num_speakers: Optional[int] = None,
+        min_speakers: Optional[int] = None,
+        max_speakers: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Execute the complete enterprise AI pipeline from raw audio/video to PostgreSQL, ChromaDB, and PDF."""
         meeting_id = meeting_id or str(uuid.uuid4())
         media_file_name = Path(audio_path).name
+        pipeline_status = "completed"
         logger.info(f"=== Starting MeetWise Enterprise Pipeline for Meeting {meeting_id} ({media_file_name}) ===")
         repo = MeetingRepository(db)
 
@@ -182,11 +187,16 @@ class MeetWisePipeline:
         # ----------------------------------------------------
         logger.info("[3/10] Running neural speaker diarization...")
         try:
-            speaker_turns = self.pyannote.diarize(clean_audio)
+            speaker_turns = self.pyannote.diarize(
+                clean_audio,
+                num_speakers=num_speakers,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers
+            )
             logger.info(f"pyannote detected {len(speaker_turns)} speaker turns.")
         except Exception as e:
-            logger.warning(f"pyannote diarization failed or was skipped: {e}. Falling back to default speaker.")
-            speaker_turns = []
+            logger.error(f"CRITICAL: pyannote diarization failed: {e}")
+            raise PipelineExecutionError(f"Speaker Diarization failed: {e}. Please ensure your HF_TOKEN is valid and you have accepted the model terms on Hugging Face.")
 
         # ----------------------------------------------------
         # Phase 4: Temporal Intersection Alignment
@@ -195,8 +205,12 @@ class MeetWisePipeline:
         try:
             aligned_segments = self.aligner.align(raw_segments, speaker_turns)
             logger.info(f"Aligned {len(aligned_segments)} speech turns.")
-        except Exception as e:
-            raise PipelineExecutionError(f"Transcript alignment failed: {e}")
+        except (AlignmentError, Exception) as e:
+            logger.warning(f"Transcript alignment failed: {e}. Marking meeting as degraded.")
+            pipeline_status = "degraded"
+            aligned_segments = [
+                {**seg, "speaker": "UNATTRIBUTED"} for seg in raw_segments
+            ]
 
         # ----------------------------------------------------
         # Phase 5: Voice Biometrics & Speaker Recognition
@@ -219,21 +233,34 @@ class MeetWisePipeline:
             speaker_audio_slices = self._extract_speaker_audio_slices(clean_audio, aligned_segments)
             unique_spks = sorted(list(set(s.get("speaker") for s in aligned_segments if "speaker" in s)))
 
+            # Score every diarized speaker against every voiceprint first.
+            scored: Dict[str, List[Dict[str, Any]]] = {}
             for spk_label in unique_spks:
                 spk_audio = speaker_audio_slices.get(spk_label)
-                if spk_audio is not None and len(spk_audio) > 800:
-                    id_res = self.speaker_recognition.identify_speaker(spk_audio, enrolled_data)
-                else:
-                    id_res = {
-                        "name": "Unknown Speaker",
-                        "employee_id": None,
-                        "confidence": 75.0,
-                        "is_unknown": True,
-                    }
+                if spk_audio is None or not enrolled_data:
+                    speaker_identifications[spk_label] = SpeakerRecognitionEngine._unknown(
+                        "no audio for this speaker" if spk_audio is None else "no employees enrolled"
+                    )
+                    continue
+                try:
+                    scored[spk_label] = self.speaker_recognition.score_speaker(spk_audio, enrolled_data)
+                except VoiceEmbeddingError as emb_err:
+                    speaker_identifications[spk_label] = SpeakerRecognitionEngine._unknown(str(emb_err))
+
+            # One employee can be only one diarized speaker: assign the strongest
+            # matches first, then re-evaluate the rest without the taken employees.
+            assigned_ids: set = set()
+            order = sorted(scored, key=lambda k: scored[k][0]["similarity"] if scored[k] else -1.0, reverse=True)
+            for spk_label in order:
+                id_res = self.speaker_recognition.decide(scored[spk_label], excluded_ids=assigned_ids)
+                if not id_res["is_unknown"]:
+                    assigned_ids.add(id_res["employee_id"])
                 speaker_identifications[spk_label] = id_res
+
+            for spk_label, id_res in speaker_identifications.items():
                 logger.info(
-                    f"Speaker '{spk_label}' identified as '{id_res['name']}' "
-                    f"(Confidence: {id_res['confidence']}%)"
+                    f"Speaker '{spk_label}' -> '{id_res['name']}' "
+                    f"(cosine similarity {id_res['confidence']:.3f}; {id_res.get('reason', '')})"
                 )
 
             # Update speaker names in aligned_segments if identified
@@ -243,6 +270,13 @@ class MeetWisePipeline:
                     resolved = speaker_identifications[raw_spk]["name"]
                     if resolved != "Unknown Speaker":
                         seg["speaker"] = resolved
+
+            # Key identifications by the label the segments now carry, so persistence
+            # finds the real similarity score / employee link for identified speakers.
+            speaker_identifications = {
+                (spk if info.get("is_unknown") else info["name"]): info
+                for spk, info in speaker_identifications.items()
+            }
 
         except Exception as bio_err:
             logger.warning(f"Speaker recognition warning: {bio_err}. Proceeding with diarization labels.")
@@ -258,7 +292,9 @@ class MeetWisePipeline:
         # Phase 6: Gemini Enterprise Meeting Intelligence
         # ----------------------------------------------------
         logger.info("[6/10] Extracting enterprise intelligence with Gemini...")
-        known_names = [e["name"] for e in enrolled_data] if "enrolled_data" in locals() else []
+        # Only names that were verified by voice. Passing the whole roster invites the
+        # LLM to attribute "Unknown Speaker"/SPEAKER_xx turns to people who never spoke.
+        known_names = sorted({i["name"] for i in speaker_identifications.values() if not i.get("is_unknown")})
         configured_kws = [k.keyword for k in repo.list_configured_keywords()]
 
         try:
@@ -293,13 +329,14 @@ class MeetWisePipeline:
         style_map = {e.speaker: e.speaking_style for e in intelligence.emotions}
         accent_map = {a.speaker: a.detected_accent for a in intelligence.accents}
 
-        for seg in aligned_segments:
+        segment_emotion_map = {se.segment: se.emotion for se in intelligence.segment_emotions}
+
+        for idx, seg in enumerate(aligned_segments):
             spk_name = seg.get("speaker")
-            seg["emotion"] = emotion_map.get(spk_name, "neutral")
+            seg["emotion"] = segment_emotion_map.get(idx, "neutral")
             seg["speaking_style"] = style_map.get(spk_name, "professional")
 
-        for spk_lbl, id_info in speaker_identifications.items():
-            spk_name = id_info.get("name", spk_lbl)
+        for spk_name, id_info in speaker_identifications.items():
             if spk_name in accent_map:
                 id_info["accent"] = accent_map[spk_name]
             if spk_name in emotion_map:
@@ -320,6 +357,7 @@ class MeetWisePipeline:
                 intelligence=intelligence,
                 speaker_identifications=speaker_identifications,
                 media_type=media_type,
+                status=pipeline_status,
             )
         except Exception as e:
             raise PipelineExecutionError(f"Database persistence failed: {e}")

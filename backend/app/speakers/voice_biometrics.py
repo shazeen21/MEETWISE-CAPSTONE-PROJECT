@@ -1,8 +1,7 @@
 """Voice Biometrics and Speaker Recognition Service for MeetWise AI Enterprise.
 
-Extracts normalized acoustic voiceprint embeddings based on Mel-frequency filterbanks
-and spectral pitch/formant statistics. Performs cosine similarity matching with calibrated
-confidence scores, supports unknown speaker detection, and enables continuous profile adaptation.
+Extracts neural voice embeddings using a pretrained ECAPA-TDNN model via SpeechBrain.
+Performs cosine similarity matching with calibrated thresholds to identify speakers.
 """
 
 import json
@@ -10,188 +9,160 @@ import logging
 from typing import Dict, Any, List, Optional, Tuple, Union
 import numpy as np
 import soundfile as sf
-from scipy.signal import spectrogram
+import torch
+try:
+    from speechbrain.inference.speaker import EncoderClassifier
+except ImportError:  # speechbrain < 1.0
+    from speechbrain.pretrained import EncoderClassifier
 
 logger = logging.getLogger(__name__)
 
+# ECAPA-TDNN embeddings from SpeechBrain typically have 192 dimensions
 EMBEDDING_DIM = 192
-DEFAULT_CONFIDENCE_THRESHOLD = 0.70  # Stricter cosine similarity cutoff
+DEFAULT_CONFIDENCE_THRESHOLD = 0.25  # Calibrated cosine similarity threshold for ECAPA-TDNN
+# Top match must beat the runner-up by this much, otherwise the speaker is ambiguous
+DEFAULT_AMBIGUITY_MARGIN = 0.05
+MIN_SPEECH_DURATION = 1.0  # Minimum seconds of speech required for robust embedding
+TARGET_SAMPLE_RATE = 16000
 
+
+class VoiceEmbeddingError(Exception):
+    """Raised when a reliable voice embedding cannot be extracted from audio.
+
+    Never substitute a placeholder vector: identical placeholders make every
+    speaker look like every enrolled employee (cosine similarity 1.0).
+    """
+    pass
 
 class VoiceBiometricsService:
-    """Extracts acoustic voiceprint embeddings from 16kHz audio."""
+    """Extracts neural voice embeddings using a pretrained ECAPA-TDNN model via SpeechBrain."""
 
-    def __init__(self, embedding_dim: int = EMBEDDING_DIM):
-        self.embedding_dim = embedding_dim
-        # Deterministic Mel-scale filterbank weights
-        self._mel_filters = self._build_mel_filterbank(num_filters=40, n_fft=512, sr=16000)
-        # Deterministic orthonormal/normalized projection matrix (128 x embedding_dim)
-        rng = np.random.RandomState(42)
-        proj = rng.randn(128, self.embedding_dim).astype(np.float32)
-        self._projection_matrix = proj / np.linalg.norm(proj, axis=0, keepdims=True)
+    embedding_dim = EMBEDDING_DIM
 
-    @staticmethod
-    def _hz_to_mel(hz: float) -> float:
-        return 2595.0 * np.log10(1.0 + hz / 700.0)
+    def __init__(self, model_path: str = "speechbrain/spkrec-ecapa-voxceleb"):
+        self.model_path = model_path
+        self._classifier = None
 
-    @staticmethod
-    def _mel_to_hz(mel: float) -> float:
-        return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
-
-    def _build_mel_filterbank(self, num_filters: int, n_fft: int, sr: int) -> np.ndarray:
-        """Construct triangular Mel filterbank matrix."""
-        low_freq = 50.0
-        high_freq = sr / 2.0
-        low_mel = self._hz_to_mel(low_freq)
-        high_mel = self._hz_to_mel(high_freq)
-
-        mel_points = np.linspace(low_mel, high_mel, num_filters + 2)
-        hz_points = self._mel_to_hz(mel_points)
-        bin_points = np.floor((n_fft + 1) * hz_points / sr).astype(int)
-
-        filters = np.zeros((num_filters, int(n_fft // 2 + 1)))
-        for m in range(1, num_filters + 1):
-            f_m_minus = bin_points[m - 1]
-            f_m = bin_points[m]
-            f_m_plus = bin_points[m + 1]
-
-            for k in range(f_m_minus, f_m):
-                if f_m != f_m_minus:
-                    filters[m - 1, k] = (k - f_m_minus) / (f_m - f_m_minus)
-            for k in range(f_m, f_m_plus):
-                if f_m_plus != f_m:
-                    filters[m - 1, k] = (f_m_plus - k) / (f_m_plus - f_m)
-
-        return filters
+    def _get_classifier(self):
+        """Lazy load the SpeechBrain EncoderClassifier."""
+        if self._classifier is None:
+            try:
+                logger.info(f"Loading SpeechBrain speaker encoder: {self.model_path}...")
+                # Pin to CPU: on Apple Silicon SpeechBrain otherwise picks MPS and
+                # tensor.numpy() fails, which previously broke every extraction.
+                self._classifier = EncoderClassifier.from_hparams(
+                    source=self.model_path,
+                    savedir="pretrained_models/spkrec-ecapa-voxceleb",
+                    run_opts={"device": "cpu"},
+                )
+                logger.info("Speaker encoder loaded successfully.")
+            except Exception as e:
+                logger.error(f"Failed to load SpeechBrain model: {e}")
+                raise RuntimeError(f"Could not initialize speaker encoder: {e}")
+        return self._classifier
 
     def _load_audio(
         self,
         audio: Union[str, np.ndarray],
-        target_sr: int = 16000,
         sample_rate: Optional[int] = None,
-    ) -> np.ndarray:
-        """Load audio into a 1D float32 numpy array."""
+    ) -> Tuple[np.ndarray, int]:
+        """Load audio into a float32 numpy array and return with sample rate."""
         if isinstance(audio, np.ndarray):
             data = audio.astype(np.float32)
             if data.ndim > 1:
                 data = data.mean(axis=1)
-            if sample_rate and sample_rate != target_sr:
-                from scipy.signal import resample
-                num_samples = int(len(data) * float(target_sr) / sample_rate)
-                data = resample(data, num_samples).astype(np.float32)
-            return data
+            sr = sample_rate or TARGET_SAMPLE_RATE
+        else:
+            try:
+                data, sr = sf.read(str(audio), dtype="float32")
+                if data.ndim > 1:
+                    data = data.mean(axis=1)
+            except Exception:
+                # libsndfile cannot read browser recordings (.webm/opus, .m4a, .mp3 on
+                # some builds), so decode those with PyAV straight to 16 kHz mono.
+                from ..audio.preprocessor import AudioPreprocessor
+                data = AudioPreprocessor._decode_with_pyav(str(audio), target_sr=TARGET_SAMPLE_RATE)
+                sr = TARGET_SAMPLE_RATE
 
-        data, sr = sf.read(str(audio), dtype="float32")
-        if data.ndim > 1:
-            data = data.mean(axis=1)
-
-        if sr != target_sr:
+        if sr != TARGET_SAMPLE_RATE:
             from scipy.signal import resample
-            num_samples = int(len(data) * float(target_sr) / sr)
+            num_samples = int(len(data) * float(TARGET_SAMPLE_RATE) / sr)
             data = resample(data, num_samples).astype(np.float32)
+            sr = TARGET_SAMPLE_RATE
 
-        return data
+        return data, sr
 
     def extract_embedding(
         self,
         audio: Union[str, np.ndarray],
         sample_rate: Optional[int] = None,
     ) -> np.ndarray:
-        """Extract a 192-d acoustic voice embedding vector from speech audio.
+        """Extract an L2-normalized neural voice embedding from speech audio.
 
-        Computes log-mel filterbank energies, temporal delta dynamics, and pitch/formant
-        moments, projecting into an L2-normalized voiceprint space.
+        Raises:
+            VoiceEmbeddingError: if the audio cannot be decoded, is too short,
+                is silent, or the model fails. Callers must treat the speaker
+                as unidentifiable rather than use a substitute vector.
         """
         try:
-            samples = self._load_audio(audio, sample_rate=sample_rate)
-            if len(samples) < 800:
-                samples = np.pad(samples, (0, max(0, 1600 - len(samples))))
+            samples, sr = self._load_audio(audio, sample_rate=sample_rate)
+        except Exception as e:
+            raise VoiceEmbeddingError(f"Could not decode audio: {e}") from e
 
-            # Energy check: if silence or near-silence, return neutral embedding
-            rms = np.sqrt(np.mean(samples ** 2))
-            if rms < 1e-4:
-                null_vec = np.zeros(self.embedding_dim, dtype=np.float32)
-                null_vec[0] = 1.0
-                return null_vec
-
-            # Pre-emphasis
-            pre_emp = np.append(samples[0], samples[1:] - 0.97 * samples[:-1])
-
-            # Spectrogram with nperseg=512 (32ms), noverlap=256 (16ms)
-            frequencies, times, sxx = spectrogram(
-                pre_emp,
-                fs=16000,
-                nperseg=512,
-                noverlap=256,
-                scaling="spectrum",
+        duration = len(samples) / sr
+        if duration < MIN_SPEECH_DURATION:
+            raise VoiceEmbeddingError(
+                f"Audio too short ({duration:.2f}s < {MIN_SPEECH_DURATION}s) for a reliable voiceprint."
             )
 
-            # Apply Mel filterbank: (40, 257) x (257, T) -> (40, T)
-            mel_energies = np.dot(self._mel_filters, sxx)
-            log_mel = np.log1p(mel_energies * 1000.0)
+        rms = float(np.sqrt(np.mean(samples ** 2)))
+        if rms < 1e-4:
+            raise VoiceEmbeddingError("Audio is near-silent; no voice to fingerprint.")
 
-            # Statistical moments across time frames
-            mel_mean = np.mean(log_mel, axis=1)  # 40 dims
-            mel_std = np.std(log_mel, axis=1)    # 40 dims
-
-            # Temporal deltas
-            mel_diff = np.diff(log_mel, axis=1)
-            delta_mean = np.mean(mel_diff, axis=1) if mel_diff.shape[1] > 0 else np.zeros_like(mel_mean)  # 40 dims
-
-            # Pitch and harmonic estimation via autocorrelation
-            autocorr = np.correlate(samples[:min(len(samples), 8000)], samples[:min(len(samples), 8000)], mode="full")
-            autocorr = autocorr[len(autocorr) // 2:]
-            # Search pitch peaks in human vocal range (60Hz - 400Hz => 40 - 266 samples)
-            search_window = autocorr[40:266]
-            pitch_peak = float(np.argmax(search_window) + 40) if len(search_window) > 0 else 100.0
-            pitch_strength = float(np.max(search_window) / (autocorr[0] + 1e-9)) if len(search_window) > 0 else 0.0
-
-            # Spectral roll-off (85% energy frequency)
-            cumsum_spec = np.cumsum(sxx, axis=0)
-            total_energy = cumsum_spec[-1, :] + 1e-9
-            rolloff_idx = np.apply_along_axis(lambda col: np.where(col >= 0.85 * col[-1])[0][0], axis=0, arr=cumsum_spec)
-            rolloff_mean = float(np.mean(frequencies[rolloff_idx]))
-            rolloff_std = float(np.std(frequencies[rolloff_idx]))
-
-            # Dynamic combined 128-dimensional acoustic feature representation
-            acoustic_features = np.concatenate([
-                mel_mean,        # 40 dims
-                mel_std,         # 40 dims
-                delta_mean,      # 40 dims
-                np.array([
-                    pitch_peak / 200.0,
-                    pitch_strength,
-                    rolloff_mean / 4000.0,
-                    rolloff_std / 2000.0,
-                    rms * 10.0,
-                    float(len(samples)) / 16000.0,
-                    float(np.mean(sxx)),
-                    float(np.std(sxx)),
-                ], dtype=np.float32),  # 8 dims -> total 128 dims
-            ])
-
-            # Zero-mean unit-variance normalization of acoustic vector
-            f_norm = acoustic_features - np.mean(acoustic_features)
-            f_std = np.std(acoustic_features)
-            if f_std > 1e-6:
-                f_norm = f_norm / f_std
-
-            # Project to embedding space
-            projected = np.dot(f_norm, self._projection_matrix)
-
-            # L2 normalize
-            norm = np.linalg.norm(projected)
-            if norm > 1e-9:
-                embedding = projected / norm
-            else:
-                embedding = projected
-
-            return embedding.astype(np.float32)
-
+        try:
+            classifier = self._get_classifier()
+            # SpeechBrain expects torch tensor [batch, time]
+            tensor_audio = torch.from_numpy(np.ascontiguousarray(samples, dtype=np.float32)).unsqueeze(0)
+            with torch.no_grad():
+                embeddings = classifier.encode_batch(tensor_audio)
+            # embeddings shape: [batch, 1, dim] -> [dim]
+            embedding = embeddings.squeeze().detach().cpu().numpy()
         except Exception as e:
-            logger.warning(f"Voice embedding extraction error: {e}. Generating fallback embedding.")
-            vec = np.ones(self.embedding_dim, dtype=np.float32)
-            return vec / np.linalg.norm(vec)
+            raise VoiceEmbeddingError(f"Neural embedding extraction failed: {e}") from e
+
+        if embedding.shape != (EMBEDDING_DIM,) or not np.all(np.isfinite(embedding)):
+            raise VoiceEmbeddingError(f"Model returned an invalid embedding of shape {embedding.shape}.")
+
+        norm = np.linalg.norm(embedding)
+        if norm < 1e-9:
+            raise VoiceEmbeddingError("Model returned a zero embedding.")
+        return (embedding / norm).astype(np.float32)
+
+    def check_speech_like(self, audio: Union[str, np.ndarray], sample_rate: Optional[int] = None) -> None:
+        """Reject enrollment audio that is not human speech (test tones, hum, beeps).
+
+        A voiceprint built from a pure tone matches any other tone and none of the
+        person's real speech. Speech spreads its energy over many harmonics; a tone
+        puts nearly all of it in one narrow band.
+
+        Raises:
+            VoiceEmbeddingError: if the audio is a near-pure tone.
+        """
+        try:
+            samples, sr = self._load_audio(audio, sample_rate=sample_rate)
+        except Exception as e:
+            raise VoiceEmbeddingError(f"Could not decode audio: {e}") from e
+        power = np.abs(np.fft.rfft(samples)) ** 2
+        total = power.sum()
+        if total <= 0:
+            raise VoiceEmbeddingError("Audio is silent.")
+        freqs = np.fft.rfftfreq(len(samples), 1.0 / sr)
+        peak = freqs[np.argmax(power)]
+        band_share = power[np.abs(freqs - peak) <= 20.0].sum() / total
+        if band_share > 0.5:
+            raise VoiceEmbeddingError(
+                f"Audio is a {peak:.0f} Hz tone ({band_share:.0%} of energy in one band), not human speech."
+            )
 
     def aggregate_centroid(self, embeddings: List[Union[List[float], np.ndarray]]) -> List[float]:
         """Compute the L2-normalized centroid vector across multiple voice samples."""
@@ -217,9 +188,11 @@ class SpeakerRecognitionEngine:
         self,
         biometrics_service: Optional[VoiceBiometricsService] = None,
         confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+        ambiguity_margin: float = DEFAULT_AMBIGUITY_MARGIN,
     ):
         self.biometrics = biometrics_service or VoiceBiometricsService()
         self.confidence_threshold = confidence_threshold
+        self.ambiguity_margin = ambiguity_margin
 
     @staticmethod
     def cosine_similarity(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
@@ -230,86 +203,97 @@ class SpeakerRecognitionEngine:
             return 0.0
         return float(np.dot(vec_a, vec_b) / (norm_a * norm_b))
 
-    def identify_speaker(
+    @staticmethod
+    def _unknown(reason: str, similarity: float = 0.0, matches: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        return {
+            "name": "Unknown Speaker",
+            "employee_id": None,
+            "confidence": round(float(similarity), 4),
+            "is_unknown": True,
+            "raw_similarity": round(float(similarity), 4),
+            "all_matches": matches or [],
+            "reason": reason,
+        }
+
+    def score_speaker(
         self,
         speaker_audio: Union[str, np.ndarray],
         enrolled_employees: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """Identify an unknown speaker against enrolled employee voice profiles."""
-        turn_embedding = self.biometrics.extract_embedding(speaker_audio)
+    ) -> List[Dict[str, Any]]:
+        """Return cosine similarity of the speaker against every enrolled voiceprint, best first.
 
-        if not enrolled_employees:
-            return {
-                "name": "Unknown Speaker",
-                "employee_id": None,
-                "confidence": 75.0,
-                "is_unknown": True,
-                "raw_similarity": 0.0,
-                "all_matches": [],
-            }
+        Raises VoiceEmbeddingError if the speaker audio is unusable.
+        """
+        turn_embedding = self.biometrics.extract_embedding(speaker_audio)
 
         matches = []
         for emp in enrolled_employees:
             emb_data = emp.get("voice_embedding")
             if not emb_data:
                 continue
-
-            if isinstance(emb_data, str):
-                try:
-                    emp_vec = np.array(json.loads(emb_data), dtype=np.float32)
-                except Exception:
-                    continue
-            else:
-                emp_vec = np.array(emb_data, dtype=np.float32)
+            try:
+                emp_vec = np.array(json.loads(emb_data) if isinstance(emb_data, str) else emb_data, dtype=np.float32)
+            except Exception:
+                continue
+            if emp_vec.shape != turn_embedding.shape:
+                logger.warning(
+                    f"Skipping voiceprint for {emp.get('name')}: dimension {emp_vec.shape} != {turn_embedding.shape}. "
+                    "Re-enroll this employee."
+                )
+                continue
 
             sim = self.cosine_similarity(turn_embedding, emp_vec)
-
-            # Calibrate similarity to realistic confidence percentage
-            if sim >= self.confidence_threshold:
-                # Map [threshold, 1.0] -> [75.0, 99.0]
-                conf = 75.0 + 24.0 * ((sim - self.confidence_threshold) / max(1e-5, (1.0 - self.confidence_threshold)))
-            else:
-                # Below threshold: [0, threshold] -> [40.0, 74.0]
-                conf = max(40.0, 74.0 * (max(0.0, sim) / max(1e-5, self.confidence_threshold)))
-
             matches.append({
                 "id": emp.get("id"),
                 "employee_id": emp.get("employee_id"),
                 "name": emp.get("name"),
                 "similarity": round(float(sim), 4),
-                "confidence": round(float(min(99.0, max(40.0, conf))), 1),
             })
 
         matches.sort(key=lambda x: x["similarity"], reverse=True)
+        return matches
 
-        if matches and matches[0]["similarity"] >= self.confidence_threshold:
-            top = matches[0]
-            return {
-                "name": top["name"],
-                "employee_id": top["id"],
-                "confidence": top["confidence"],
-                "is_unknown": False,
-                "raw_similarity": top["similarity"],
-                "all_matches": matches,
-            }
-        elif matches:
-            top_sim = matches[0]["similarity"]
-            # Calibrated unknown speaker confidence score (e.g. 81%)
-            unknown_conf = round(float(min(95.0, max(60.0, 85.0 - (top_sim * 25.0)))), 1)
-            return {
-                "name": "Unknown Speaker",
-                "employee_id": None,
-                "confidence": unknown_conf,
-                "is_unknown": True,
-                "raw_similarity": top_sim,
-                "all_matches": matches,
-            }
-        else:
-            return {
-                "name": "Unknown Speaker",
-                "employee_id": None,
-                "confidence": 80.0,
-                "is_unknown": True,
-                "raw_similarity": 0.0,
-                "all_matches": [],
-            }
+    def decide(self, matches: List[Dict[str, Any]], excluded_ids: Optional[set] = None) -> Dict[str, Any]:
+        """Apply threshold + ambiguity margin to scored matches."""
+        candidates = [m for m in matches if m["id"] not in (excluded_ids or set())]
+        if not candidates:
+            return self._unknown("no enrolled voiceprints to compare", matches=matches)
+
+        top = candidates[0]
+        if top["similarity"] < self.confidence_threshold:
+            return self._unknown(
+                f"best match {top['name']} ({top['similarity']:.2f}) is below threshold {self.confidence_threshold}",
+                top["similarity"], matches,
+            )
+
+        if len(candidates) > 1 and top["similarity"] - candidates[1]["similarity"] < self.ambiguity_margin:
+            return self._unknown(
+                f"ambiguous: {top['name']} ({top['similarity']:.2f}) vs "
+                f"{candidates[1]['name']} ({candidates[1]['similarity']:.2f})",
+                top["similarity"], matches,
+            )
+
+        return {
+            "name": top["name"],
+            "employee_id": top["id"],
+            "confidence": top["similarity"],
+            "is_unknown": False,
+            "raw_similarity": top["similarity"],
+            "all_matches": matches,
+            "reason": "matched",
+        }
+
+    def identify_speaker(
+        self,
+        speaker_audio: Union[str, np.ndarray],
+        enrolled_employees: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Identify an unknown speaker against enrolled employee voice profiles."""
+        if not enrolled_employees:
+            return self._unknown("no employees enrolled")
+        try:
+            matches = self.score_speaker(speaker_audio, enrolled_employees)
+        except VoiceEmbeddingError as e:
+            logger.warning(f"Speaker cannot be identified: {e}")
+            return self._unknown(str(e))
+        return self.decide(matches)

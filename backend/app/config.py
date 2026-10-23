@@ -27,6 +27,10 @@ try:
         GEMINI_API_KEY: str = Field(default="", description="Google Gemini API key")
         GEMINI_MODEL: str = Field(default="gemini-2.5-flash", description="Google Gemini model identifier")
         HF_TOKEN: str = Field(default="", description="Hugging Face token for pyannote.audio")
+        DIARIZATION_MODEL: str = Field(
+            default="pyannote/speaker-diarization-community-1",
+            description="pyannote pipeline (community-1 for pyannote.audio 4.x, speaker-diarization-3.1 for 3.x)",
+        )
 
         # WhisperX Configuration
         WHISPER_MODEL: str = Field(default="base", description="Whisper model size")
@@ -66,6 +70,7 @@ except ImportError:
             self.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
             self.GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
             self.HF_TOKEN = os.getenv("HF_TOKEN", "")
+            self.DIARIZATION_MODEL = os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1")
             self.WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
             self.WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
             self.WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
@@ -81,6 +86,17 @@ except ImportError:
 
 # Singleton instance
 settings = Settings()
+
+# Resolve relative paths against the project root, not the launch directory.
+# Otherwise starting uvicorn from a different folder silently opens a different
+# (often empty) SQLite file and the UI shows no meetings / "Failed to load".
+_sqlite_prefix = "sqlite:///"
+if settings.DATABASE_URL.startswith(_sqlite_prefix):
+    _db_path = settings.DATABASE_URL[len(_sqlite_prefix):]
+    if _db_path and _db_path != ":memory:" and not Path(_db_path).is_absolute():
+        settings.DATABASE_URL = _sqlite_prefix + str((BASE_DIR / _db_path).resolve())
+if not Path(settings.CHROMA_PERSIST_DIR).is_absolute():
+    settings.CHROMA_PERSIST_DIR = str((BASE_DIR / settings.CHROMA_PERSIST_DIR).resolve())
 
 # Ensure directories exist
 for directory in [

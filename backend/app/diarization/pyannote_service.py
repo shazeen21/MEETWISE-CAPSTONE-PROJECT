@@ -8,6 +8,7 @@ Preloads audio into memory via SoundFile to eliminate FFmpeg and TorchCodec bina
 import logging
 from typing import Dict, Any, List, Optional
 import numpy as np
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ class PyannoteService:
     def __init__(
         self,
         hf_token: Optional[str] = None,
-        pipeline_name: str = "pyannote/speaker-diarization-3.1",
+        pipeline_name: str = "pyannote/speaker-diarization-community-1",
         device: str = "cpu",
     ):
         self.hf_token = hf_token
@@ -118,8 +119,15 @@ class PyannoteService:
 
             speaker_turns: List[Dict[str, Any]] = []
 
-            # pyannote diarization output iterator
-            for turn, _, speaker in diarization_output.itertracks(yield_label=True):
+            # pyannote >= 4 returns a DiarizeOutput wrapper; 3.x returns the Annotation.
+            # Prefer the exclusive (non-overlapping) view so each word maps to one speaker.
+            annotation = (
+                getattr(diarization_output, "exclusive_speaker_diarization", None)
+                or getattr(diarization_output, "speaker_diarization", None)
+                or diarization_output
+            )
+
+            for turn, _, speaker in annotation.itertracks(yield_label=True):
                 speaker_turns.append({
                     "speaker": str(speaker),
                     "start": round(float(turn.start), 2),

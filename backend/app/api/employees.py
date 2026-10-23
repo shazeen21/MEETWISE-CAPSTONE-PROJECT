@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..database.connection import get_db
 from ..database.repository import MeetingRepository
-from ..speakers.voice_biometrics import VoiceBiometricsService
+from ..speakers.voice_biometrics import VoiceBiometricsService, VoiceEmbeddingError
 
 logger = logging.getLogger(__name__)
 
@@ -187,20 +187,30 @@ async def upload_voice_sample(
         with open(dest_path, "wb") as f:
             f.write(contents)
 
-        # Extract 192-d acoustic voiceprint embedding
-        sample_emb = biometrics_service.extract_embedding(str(dest_path))
+        # Extract 192-d ECAPA-TDNN voiceprint embedding. Reject unusable recordings
+        # instead of storing a placeholder that would match every other speaker.
+        try:
+            biometrics_service.check_speech_like(str(dest_path))
+            sample_emb = biometrics_service.extract_embedding(str(dest_path))
+        except VoiceEmbeddingError as emb_err:
+            dest_path.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Voice sample rejected: {emb_err} Please record again (at least a few seconds of clear speech).",
+            )
         sample_emb_list = [round(float(x), 6) for x in sample_emb]
 
         # Calculate duration
         try:
-            import soundfile as sf
-            info = sf.info(str(dest_path))
-            duration = round(info.duration, 2)
+            from ..audio.preprocessor import AudioPreprocessor
+            prep = AudioPreprocessor()
+            meta = prep.extract_metadata(str(dest_path))
+            duration = meta.get("duration_seconds", 0.0)
         except Exception:
-            duration = 5.0
+            duration = 0.0
 
         # Save sample to database
-        repo.add_voice_sample(
+        saved_sample = repo.add_voice_sample(
             employee_id=emp.id,
             audio_file_name=dest_name,
             duration_seconds=duration,
@@ -209,16 +219,24 @@ async def upload_voice_sample(
         )
 
         # Re-aggregate all samples for this employee to compute centroid vector
-        all_samples = [sample for sample in emp.voice_samples if sample.id != sample_id]
+        from ..database.models import VoiceSample
+        all_samples = db.query(VoiceSample).filter(VoiceSample.employee_id == emp.id).all()
         sample_vectors = []
         for s in all_samples:
             if s.embedding_vector:
                 import json
-                sample_vectors.append(json.loads(s.embedding_vector))
-        sample_vectors.append(sample_emb_list)
+                try:
+                    sample_vectors.append(json.loads(s.embedding_vector))
+                except Exception:
+                    pass
+        if not sample_vectors:
+            sample_vectors.append(sample_emb_list)
 
         new_centroid = biometrics_service.aggregate_centroid(sample_vectors)
         repo.update_employee_voice_profile(emp.id, new_centroid)
+
+        # Refresh employee record
+        db.refresh(emp)
 
         logger.info(f"Successfully enrolled voice sample for employee {emp.name} ({emp.employee_id})")
         return VoiceEnrollmentResponse(
@@ -230,6 +248,8 @@ async def upload_voice_sample(
             sample_duration_seconds=duration,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Voice enrollment failed: {e}")
+        logger.exception(f"Voice enrollment failed: {e}")
         raise HTTPException(status_code=500, detail=f"Voice enrollment failed: {e}")

@@ -22,6 +22,17 @@ from backend.app.meeting_intelligence.schemas import (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolated_storage(tmp_path, monkeypatch):
+    """Keep uploads, processed audio, transcripts and reports out of the real data/ folder."""
+    from backend.app.config import settings
+    for attr in ("DATA_DIR", "AUDIO_DIR", "PROCESSED_DIR", "TRANSCRIPTS_DIR"):
+        target = tmp_path / "data" / attr.lower()
+        target.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(settings, attr, str(target))
+    monkeypatch.chdir(tmp_path)  # relative paths such as data/reports land in tmp too
+
+
 @pytest.fixture
 def db_session():
     """In-memory SQLite database session for unit tests."""
