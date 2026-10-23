@@ -14,6 +14,10 @@ try:
     from speechbrain.inference.speaker import EncoderClassifier
 except ImportError:  # speechbrain < 1.0
     from speechbrain.pretrained import EncoderClassifier
+try:
+    from speechbrain.utils.fetching import LocalStrategy
+except ImportError:  # older speechbrain always symlinks
+    LocalStrategy = None
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +54,16 @@ class VoiceBiometricsService:
                 logger.info(f"Loading SpeechBrain speaker encoder: {self.model_path}...")
                 # Pin to CPU: on Apple Silicon SpeechBrain otherwise picks MPS and
                 # tensor.numpy() fails, which previously broke every extraction.
+                # Copy instead of symlink: Windows refuses symlinks without admin or
+                # Developer Mode (WinError 1314).
+                extra = {}
+                if LocalStrategy is not None:
+                    extra["local_strategy"] = LocalStrategy.COPY
                 self._classifier = EncoderClassifier.from_hparams(
                     source=self.model_path,
                     savedir="pretrained_models/spkrec-ecapa-voxceleb",
                     run_opts={"device": "cpu"},
+                    **extra,
                 )
                 logger.info("Speaker encoder loaded successfully.")
             except Exception as e:
