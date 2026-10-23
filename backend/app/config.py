@@ -25,7 +25,7 @@ try:
 
         # External APIs & Authentication
         GEMINI_API_KEY: str = Field(default="", description="Google Gemini API key")
-        GEMINI_MODEL: str = Field(default="gemini-2.5-flash", description="Google Gemini model identifier")
+        GEMINI_MODEL: str = Field(default="gemini-3.6-flash", description="Google Gemini model identifier")
         HF_TOKEN: str = Field(default="", description="Hugging Face token for pyannote.audio")
         DIARIZATION_MODEL: str = Field(
             default="pyannote/speaker-diarization-community-1",
@@ -68,7 +68,7 @@ except ImportError:
         def __init__(self):
             self.DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/meetwise.db")
             self.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-            self.GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+            self.GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
             self.HF_TOKEN = os.getenv("HF_TOKEN", "")
             self.DIARIZATION_MODEL = os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1")
             self.WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")

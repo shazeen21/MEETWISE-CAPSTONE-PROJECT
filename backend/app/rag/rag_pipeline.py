@@ -49,7 +49,7 @@ class RAGPipeline:
         bge_service: BGEEmbeddingService,
         chroma_service: ChromaService,
         gemini_api_key: Optional[str] = None,
-        model_name: str = "gemini-2.5-flash",
+        model_name: str = "gemini-3.6-flash",
     ):
         self.bge_service = bge_service
         self.chroma_service = chroma_service
