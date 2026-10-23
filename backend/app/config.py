@@ -31,6 +31,11 @@ try:
             default="pyannote/speaker-diarization-community-1",
             description="pyannote pipeline (community-1 for pyannote.audio 4.x, speaker-diarization-3.1 for 3.x)",
         )
+        # Sliding-window step as a fraction of the 10s window. pyannote's default 0.1 is
+        # ~2x slower on CPU; 0.25 measured 98.9% agreement (DER 0.011) on a real meeting.
+        DIARIZATION_SEGMENTATION_STEP: float = Field(default=0.25, gt=0.0, le=1.0)
+        # Seconds before a Gemini request is abandoned (the client default is 600s of retries).
+        GEMINI_TIMEOUT_SECONDS: float = Field(default=180.0, gt=0.0)
 
         # WhisperX Configuration
         WHISPER_MODEL: str = Field(default="base", description="Whisper model size")
@@ -71,6 +76,8 @@ except ImportError:
             self.GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
             self.HF_TOKEN = os.getenv("HF_TOKEN", "")
             self.DIARIZATION_MODEL = os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1")
+            self.DIARIZATION_SEGMENTATION_STEP = float(os.getenv("DIARIZATION_SEGMENTATION_STEP", "0.25"))
+            self.GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "180"))
             self.WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
             self.WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
             self.WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")

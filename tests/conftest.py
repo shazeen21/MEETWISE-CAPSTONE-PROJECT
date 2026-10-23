@@ -8,6 +8,7 @@ import struct
 from pathlib import Path
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import sessionmaker
 
 # Add project root to path
@@ -36,7 +37,8 @@ def isolated_storage(tmp_path, monkeypatch):
 @pytest.fixture
 def db_session():
     """In-memory SQLite database session for unit tests."""
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    # StaticPool: one shared connection, so requests served on worker threads see the same in-memory DB.
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(bind=engine)
     TestingSession = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     session = TestingSession()

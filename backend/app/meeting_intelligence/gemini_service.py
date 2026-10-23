@@ -54,6 +54,20 @@ class LLMIntelligenceError(Exception):
     pass
 
 
+def is_network_error(err: Exception) -> bool:
+    """True when the machine cannot reach Google at all (offline, DNS, refused connection).
+
+    Switching to another model cannot fix these, so callers should stop instead of
+    waiting out a full timeout once per fallback candidate. An overloaded model (503)
+    or a slow one (timeout) is not included: another model may well answer.
+    """
+    text = str(err).lower()
+    return any(k in text for k in (
+        "lookup failed", "errors resolving", "getaddrinfo", "name resolution",
+        "failed to connect", "connection refused", "connection reset", "network is unreachable",
+    ))
+
+
 class GeminiIntelligenceService:
     """Extracts comprehensive enterprise meeting intelligence using Google Gemini API."""
 
@@ -61,9 +75,11 @@ class GeminiIntelligenceService:
         self,
         api_key: Optional[str] = None,
         model_name: str = "gemini-3.6-flash",
+        timeout_seconds: float = 180.0,
     ):
         self.api_key = api_key
         self.model_name = model_name
+        self.timeout_seconds = timeout_seconds
         self._client = None
         self._genai = None
 
@@ -475,6 +491,7 @@ TRANSCRIPT:
                     "temperature": 0.2,
                     "response_mime_type": "application/json",
                 },
+                request_options={"timeout": self.timeout_seconds},
             )
 
             intelligence = self._parse_response(response.text, aligned_segments)
@@ -490,6 +507,8 @@ TRANSCRIPT:
             logger.error(f"Pydantic validation failed on Gemini response: {val_err}")
             raise LLMIntelligenceError(f"Gemini response did not match enterprise schema: {val_err}")
         except Exception as e:
+            if is_network_error(e):
+                raise LLMIntelligenceError(f"Could not reach Gemini (check the internet connection): {e}")
             logger.warning(f"Gemini model {self.model_name} failed: {e}. Trying fallback candidates...")
             models_to_try = [m for m in CANDIDATE_MODELS if m != self.model_name]
             last_exception = e
@@ -504,6 +523,7 @@ TRANSCRIPT:
                             "temperature": 0.2,
                             "response_mime_type": "application/json",
                         },
+                        request_options={"timeout": self.timeout_seconds},
                     )
                     intelligence = self._parse_response(response.text, aligned_segments)
 
@@ -512,5 +532,7 @@ TRANSCRIPT:
                     return intelligence
                 except Exception as cand_err:
                     last_exception = cand_err
+                    if is_network_error(cand_err):
+                        break
 
             raise LLMIntelligenceError(f"Gemini API request failed across all model candidates: {last_exception}")

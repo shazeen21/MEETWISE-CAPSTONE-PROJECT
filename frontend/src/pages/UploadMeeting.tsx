@@ -64,6 +64,8 @@ export default function UploadMeeting() {
   // Index of the stage the backend is running; every earlier stage is done.
   const [activeStep, setActiveStep] = useState<number>(-1)
   const [steps, setSteps] = useState<string[]>(PROCESSING_STEPS)
+  // The backend runs one meeting at a time; later uploads wait their turn.
+  const [isQueued, setIsQueued] = useState(false)
   const [result, setResult] = useState<{ id: string; title: string } | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -85,17 +87,34 @@ export default function UploadMeeting() {
 
   // ─── Live Progress ────────────────────────────────────────────────────────
 
-  function pollProgress(meetingId: string): () => void {
-    const interval = setInterval(async () => {
-      try {
-        const p = await meetingsApi.getProgress(meetingId)
-        if (p.stages?.length) setSteps(p.stages)
-        if (p.stage >= 0) setActiveStep(p.stage)
-      } catch {
-        // Transient poll failures are harmless; the next tick retries.
-      }
-    }, PROGRESS_POLL_MS)
-    return () => clearInterval(interval)
+  // Processing runs in the background on the server; follow it until it ends.
+  // Resolves on completion, rejects with the server's error on failure.
+  function waitForProcessing(meetingId: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      let started = false
+      const interval = setInterval(async () => {
+        try {
+          const p = await meetingsApi.getProgress(meetingId)
+          if (p.stages?.length) setSteps(p.stages)
+          setIsQueued(p.state === 'queued')
+          if (p.stage >= 0) setActiveStep(p.stage)
+          if (p.state === 'queued' || p.state === 'running') started = true
+          if (p.state === 'completed') {
+            clearInterval(interval)
+            resolve()
+          } else if (p.state === 'failed') {
+            clearInterval(interval)
+            reject(new Error(p.error || 'Processing failed.'))
+          } else if (p.state === 'pending' && started) {
+            // Progress is kept in server memory, so a restart forgets the run.
+            clearInterval(interval)
+            reject(new Error('Processing was interrupted because the server restarted. Open the meeting from the Meetings page and process it again.'))
+          }
+        } catch {
+          // Network blips or a server restart in progress: keep polling.
+        }
+      }, PROGRESS_POLL_MS)
+    })
   }
 
   // ─── Submit ────────────────────────────────────────────────────────────────
@@ -111,6 +130,7 @@ export default function UploadMeeting() {
     setResult(null)
     setActiveStep(-1)
     setSteps(PROCESSING_STEPS)
+    setIsQueued(false)
 
     const formData = new FormData()
     formData.append('file', file)
@@ -119,7 +139,6 @@ export default function UploadMeeting() {
     // Upload first, then process separately so the page can poll the meeting's progress.
     formData.append('process_immediately', 'false')
 
-    let stopPolling: (() => void) | null = null
     try {
       const uploaded = await meetingsApi.upload(formData)
       const meetingId: string = uploaded.meeting_id
@@ -131,16 +150,15 @@ export default function UploadMeeting() {
       }
 
       setActiveStep(0)
-      stopPolling = pollProgress(meetingId)
       const speakers = numSpeakers.trim() ? Number(numSpeakers) : undefined
-      const data = await meetingsApi.process(meetingId, speakers)
-      stopPolling()
+      await meetingsApi.process(meetingId, speakers)
+      await waitForProcessing(meetingId)
       setActiveStep(steps.length)
 
-      setResult({ id: meetingId, title: (data.meeting?.title ?? title) || file.name })
+      const meeting = await meetingsApi.get(meetingId).catch(() => null)
+      setResult({ id: meetingId, title: meeting?.title || title || file.name })
       toast.success('Meeting processed successfully!')
     } catch (err: unknown) {
-      stopPolling?.()
       const detail =
         (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
         (err instanceof Error ? err.message : 'Upload failed. Please try again.')
@@ -317,7 +335,9 @@ export default function UploadMeeting() {
           <div className="card p-6 space-y-4">
             <div className="flex items-center gap-2 mb-2">
               <Spinner className="w-4 h-4" />
-              <p className="text-sm font-semibold text-slate-200">Processing your meeting…</p>
+              <p className="text-sm font-semibold text-slate-200">
+                {isQueued ? 'Waiting for another meeting to finish processing…' : 'Processing your meeting…'}
+              </p>
             </div>
             <ol className="space-y-2.5">
               {steps.map((step, idx) => {

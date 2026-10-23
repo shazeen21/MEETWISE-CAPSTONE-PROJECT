@@ -11,7 +11,10 @@ from pydantic import BaseModel, Field
 
 from ..embeddings.bge_service import BGEEmbeddingService
 from ..vector_store.chroma_service import ChromaService
-from ..meeting_intelligence.gemini_service import LLMIntelligenceError, CANDIDATE_MODELS
+from ..meeting_intelligence.gemini_service import LLMIntelligenceError, CANDIDATE_MODELS, is_network_error
+
+# RAG answers are short; a user waiting on search should not sit through 600s of retries.
+RAG_TIMEOUT_SECONDS = 60.0
 
 logger = logging.getLogger(__name__)
 
@@ -213,9 +216,12 @@ GROUNDED ANSWER:"""
             response = client.generate_content(
                 system_prompt,
                 generation_config={"temperature": 0.0},
+                request_options={"timeout": RAG_TIMEOUT_SECONDS},
             )
             return self._build_response(clean_question, response.text, citations)
         except Exception as e:
+            if is_network_error(e):
+                raise LLMIntelligenceError(f"Could not reach Gemini (check the internet connection): {e}")
             logger.warning(f"RAG answer generation failed with {self.model_name}: {e}. Trying fallback candidates...")
             models_to_try = [m for m in CANDIDATE_MODELS if m != self.model_name]
             last_exception = e
@@ -226,6 +232,7 @@ GROUNDED ANSWER:"""
                     response = alt_model.generate_content(
                         system_prompt,
                         generation_config={"temperature": 0.0},
+                        request_options={"timeout": RAG_TIMEOUT_SECONDS},
                     )
                     self._gemini_client = alt_model
                     self.model_name = candidate_name

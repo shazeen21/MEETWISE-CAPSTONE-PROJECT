@@ -189,13 +189,14 @@ export const meetingsApi = {
       headers: { 'Content-Type': 'multipart/form-data' },
     }).then(r => r.data),
 
+  // Starts processing in the background; follow it with getProgress.
   process: (id: string, numSpeakers?: number) =>
     api.post(`/meetings/${id}/process`, null, {
-      params: numSpeakers ? { num_speakers: numSpeakers } : undefined,
+      params: { background: true, ...(numSpeakers ? { num_speakers: numSpeakers } : {}) },
     }).then(r => r.data),
 
   getProgress: (id: string) =>
-    api.get<{ stage: number; total: number; stages: string[]; state: 'pending' | 'running' | 'completed' | 'failed'; label: string | null; error: string | null }>(
+    api.get<{ stage: number; total: number; stages: string[]; state: 'pending' | 'queued' | 'running' | 'completed' | 'failed'; label: string | null; error: string | null }>(
       `/meetings/${id}/progress`,
     ).then(r => r.data),
 

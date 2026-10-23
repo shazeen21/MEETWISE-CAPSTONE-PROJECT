@@ -86,3 +86,40 @@ def test_meetings_api_flow(db_session, sample_audio_wav, sample_intelligence):
     # Cleanup overrides
     app.dependency_overrides.clear()
 
+
+
+def test_background_processing_and_busy_guards(db_session, sample_audio_wav):
+    from backend.app.pipeline import PIPELINE_PROGRESS
+    import backend.app.api.meetings as meetings_api
+
+    app.dependency_overrides[get_db] = lambda: db_session
+    mock_pipe = MagicMock()
+    app.dependency_overrides[get_pipeline] = lambda: mock_pipe
+    started = []
+    # Record the background job instead of running the (mocked) pipeline thread.
+    original = meetings_api._run_in_background
+    meetings_api._run_in_background = lambda pipe, mid, **kw: started.append(mid)
+    try:
+        client = TestClient(app)
+        with open(sample_audio_wav, "rb") as f:
+            mid = client.post(
+                "/meetings/upload",
+                files={"file": ("m.wav", f, "audio/wav")},
+                data={"process_immediately": "false"},
+            ).json()["meeting_id"]
+
+        resp = client.post(f"/meetings/{mid}/process", params={"background": True})
+        assert resp.status_code == 200 and resp.json()["status"] == "processing"
+        assert started == [mid]
+
+        # While queued/running: no second run and no deletion of the audio in use.
+        PIPELINE_PROGRESS[mid] = {**PIPELINE_PROGRESS[mid], "state": "running", "stage": 2}
+        assert client.post(f"/meetings/{mid}/process", params={"background": True}).status_code == 409
+        assert client.delete(f"/meetings/{mid}").status_code == 409
+
+        PIPELINE_PROGRESS[mid]["state"] = "completed"
+        assert client.delete(f"/meetings/{mid}").status_code == 200
+        assert client.get(f"/meetings/{mid}").status_code == 404
+    finally:
+        meetings_api._run_in_background = original
+        app.dependency_overrides.clear()

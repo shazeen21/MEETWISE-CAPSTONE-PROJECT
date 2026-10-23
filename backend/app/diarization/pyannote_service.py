@@ -26,11 +26,31 @@ class PyannoteService:
         hf_token: Optional[str] = None,
         pipeline_name: str = "pyannote/speaker-diarization-community-1",
         device: str = "cpu",
+        segmentation_step: Optional[float] = None,
     ):
+        self.segmentation_step = segmentation_step
         self.hf_token = hf_token
         self.pipeline_name = pipeline_name
         self.device = device
         self._pipeline = None
+
+    @staticmethod
+    def _apply_segmentation_step(pipeline, step: float) -> None:
+        """Rebuild the segmentation sliding window with a larger step (fewer windows to embed).
+
+        from_pretrained() offers no step argument, so this swaps the internal Inference.
+        If a pyannote version changes those internals, keep the default step.
+        """
+        try:
+            from pyannote.audio.core.inference import Inference
+            seg = pipeline._segmentation
+            pipeline._segmentation = Inference(
+                seg.model, duration=seg.duration, step=step * seg.duration,
+                skip_aggregation=True, batch_size=seg.batch_size,
+            )
+            logger.info(f"pyannote segmentation step set to {step:g} x {seg.duration:g}s window.")
+        except Exception as e:
+            logger.warning(f"Could not change pyannote segmentation step ({e}); using the default.")
 
     def preload(self) -> None:
         """Load the pipeline now, raising DiarizationError if the token or model access is invalid."""
@@ -53,6 +73,9 @@ class PyannoteService:
                     self.pipeline_name,
                     token=self.hf_token,
                 )
+
+                if self.segmentation_step:
+                    self._apply_segmentation_step(self._pipeline, self.segmentation_step)
 
                 import torch
                 if self.device == "cuda" and torch.cuda.is_available():

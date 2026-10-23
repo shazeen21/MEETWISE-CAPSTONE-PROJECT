@@ -98,8 +98,9 @@ export default function MeetingsList() {
         toast.success('Meeting deleted successfully')
         setDeletingId(null)
       },
-      onError: () => {
-        toast.error('Failed to delete meeting. Please try again.')
+      onError: (err: unknown) => {
+        const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+        toast.error(detail || 'Failed to delete meeting. Please try again.')
         setDeletingId(null)
       },
     },

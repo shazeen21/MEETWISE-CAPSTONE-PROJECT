@@ -17,6 +17,7 @@ import os
 import json
 import uuid
 import logging
+import threading
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from sqlalchemy.orm import Session
@@ -57,6 +58,10 @@ PIPELINE_STAGES = [
 # meeting_id -> {"stage": int, "total": int, "label": str, "state": "running"|"completed"|"failed", "error": str|None}
 # In-memory only: progress is lost on restart, which is fine for a live UI indicator.
 PIPELINE_PROGRESS: Dict[str, Dict[str, Any]] = {}
+
+# One meeting at a time: the ASR/diarization models are shared and not thread-safe,
+# and two concurrent runs can exhaust RAM on a CPU machine. Later uploads queue here.
+_PIPELINE_LOCK = threading.Lock()
 
 
 def _report_stage(meeting_id: str, stage: int) -> None:
@@ -107,6 +112,7 @@ class MeetWisePipeline:
             hf_token=settings.HF_TOKEN,
             pipeline_name=settings.DIARIZATION_MODEL,
             device=settings.WHISPER_DEVICE,
+            segmentation_step=settings.DIARIZATION_SEGMENTATION_STEP,
         )
 
         # 4. Alignment
@@ -119,6 +125,7 @@ class MeetWisePipeline:
         self.gemini = gemini_service or GeminiIntelligenceService(
             api_key=settings.GEMINI_API_KEY,
             model_name=settings.GEMINI_MODEL,
+            timeout_seconds=settings.GEMINI_TIMEOUT_SECONDS,
         )
 
         # 7. Semantic Chunking & Vector Store
@@ -169,9 +176,14 @@ class MeetWisePipeline:
     def process_meeting(self, audio_path: str, db: Session, meeting_id: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         """Run the pipeline while recording stage progress in PIPELINE_PROGRESS for the UI."""
         meeting_id = meeting_id or str(uuid.uuid4())
-        _report_stage(meeting_id, 0)
+        PIPELINE_PROGRESS[meeting_id] = {
+            "stage": -1, "total": len(PIPELINE_STAGES), "label": "Waiting for another meeting to finish",
+            "state": "queued", "error": None,
+        }
         try:
-            result = self._run_pipeline(audio_path, db, meeting_id=meeting_id, **kwargs)
+            with _PIPELINE_LOCK:
+                _report_stage(meeting_id, 0)
+                result = self._run_pipeline(audio_path, db, meeting_id=meeting_id, **kwargs)
         except Exception as e:
             PIPELINE_PROGRESS[meeting_id].update(state="failed", error=str(e))
             raise

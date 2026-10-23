@@ -5,7 +5,6 @@ Transcribes audio into timestamped segments and runs phoneme alignment.
 Includes native SoundFile audio loading (zero FFmpeg dependency) and faster-whisper fallback.
 """
 
-import os
 import logging
 from typing import Dict, Any, List, Optional
 import numpy as np
@@ -71,12 +70,12 @@ class WhisperXService:
                     f"Loading WhisperX model '{self.model_name}' on device '{self.device}' "
                     f"with compute_type '{self.compute_type}'..."
                 )
-                # faster-whisper defaults to 4 CPU threads; use the whole machine.
+                # Keep CTranslate2's default 4 threads: threads=16 crashed the whole
+                # process on Windows with a native stack overflow during encoding.
                 self._model = whisperx.load_model(
                     self.model_name,
                     device=self.device,
                     compute_type=self.compute_type,
-                    threads=os.cpu_count() or 4,
                 )
                 logger.info("WhisperX model loaded successfully.")
             except ImportError:

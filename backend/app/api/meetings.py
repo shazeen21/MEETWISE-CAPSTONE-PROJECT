@@ -17,12 +17,12 @@ import shutil
 import logging
 from pathlib import Path
 from typing import List, Optional, Dict, Any
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, UploadFile, File, Form, HTTPException, status, Query
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..database.connection import get_db
+from ..database.connection import get_db, SessionLocal
 from ..database.repository import MeetingRepository
 from ..audio.preprocessor import SUPPORTED_EXTENSIONS
 from ..pipeline import MeetWisePipeline, PipelineExecutionError, PIPELINE_PROGRESS, PIPELINE_STAGES
@@ -39,6 +39,24 @@ pdf_gen = MOMPDFGenerator(output_dir=str(REPORTS_DIR))
 
 def _default_title(file_name: str) -> str:
     return f"Meeting ({file_name})"
+
+
+def _is_busy(meeting_id: str) -> bool:
+    return PIPELINE_PROGRESS.get(meeting_id, {}).get("state") in ("queued", "running")
+
+
+def _run_in_background(pipeline: MeetWisePipeline, meeting_id: str, **kwargs) -> None:
+    """Run the pipeline with its own DB session; the request that started it has returned.
+
+    Outcome is recorded in PIPELINE_PROGRESS (completed / failed + error) for the UI.
+    """
+    db = SessionLocal()
+    try:
+        pipeline.process_meeting(db=db, meeting_id=meeting_id, **kwargs)
+    except Exception as e:
+        logger.error(f"Background pipeline error for meeting {meeting_id}: {e}")
+    finally:
+        db.close()
 
 
 def get_pipeline() -> MeetWisePipeline:
@@ -132,9 +150,11 @@ def upload_meeting_media(
 @router.post("/{meeting_id}/process")
 def process_existing_meeting(
     meeting_id: str,
+    background_tasks: BackgroundTasks,
     num_speakers: Optional[int] = Query(None, ge=1, le=20, description="Exact number of speakers, if known"),
     min_speakers: Optional[int] = Query(None, ge=1, le=20),
     max_speakers: Optional[int] = Query(None, ge=1, le=20),
+    background: bool = Query(False, description="Return immediately and follow GET /{id}/progress"),
     db: Session = Depends(get_db),
     pipeline: MeetWisePipeline = Depends(get_pipeline),
 ):
@@ -143,6 +163,8 @@ def process_existing_meeting(
     meeting = repo.get_meeting(meeting_id)
     if not meeting:
         raise HTTPException(status_code=404, detail=f"Meeting with ID '{meeting_id}' not found.")
+    if _is_busy(meeting_id):
+        raise HTTPException(status_code=409, detail="This meeting is already being processed.")
 
     media_path = Path(settings.AUDIO_DIR) / meeting.audio_file_name
     if not media_path.exists():
@@ -153,17 +175,26 @@ def process_existing_meeting(
     if user_title == _default_title(meeting.audio_file_name.split("_", 1)[-1]):
         user_title = None
 
+    run_args = dict(
+        audio_path=str(media_path),
+        title=user_title,
+        source_type=meeting.source_type,
+        num_speakers=num_speakers,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+    )
+
+    if background:
+        # Mark as queued now so a poll arriving before the task starts sees it.
+        PIPELINE_PROGRESS[meeting.id] = {
+            "stage": -1, "total": len(PIPELINE_STAGES), "label": "Waiting to start",
+            "state": "queued", "error": None,
+        }
+        background_tasks.add_task(_run_in_background, pipeline, meeting.id, **run_args)
+        return {"status": "processing", "meeting_id": meeting.id}
+
     try:
-        result = pipeline.process_meeting(
-            audio_path=str(media_path),
-            db=db,
-            meeting_id=meeting.id,
-            title=user_title,
-            source_type=meeting.source_type,
-            num_speakers=num_speakers,
-            min_speakers=min_speakers,
-            max_speakers=max_speakers,
-        )
+        result = pipeline.process_meeting(db=db, meeting_id=meeting.id, **run_args)
         return {"status": "completed", "meeting": result}
     except Exception as e:
         logger.error(f"Pipeline error for meeting {meeting_id}: {e}")
@@ -177,6 +208,9 @@ def delete_meeting(meeting_id: str, db: Session = Depends(get_db), pipeline: Mee
     meeting = repo.get_meeting(meeting_id)
     if not meeting:
         raise HTTPException(status_code=404, detail=f"Meeting '{meeting_id}' not found.")
+    # Deleting mid-run removes the audio the pipeline is still reading.
+    if _is_busy(meeting_id):
+        raise HTTPException(status_code=409, detail="This meeting is still processing. Wait for it to finish before deleting it.")
 
     stem = Path(meeting.audio_file_name).stem
     files = [
